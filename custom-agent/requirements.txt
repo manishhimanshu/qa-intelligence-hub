@@ -1,0 +1,8 @@
+langchain
+langchain-openai
+langchain-community
+openpyxl
+requests
+python-dotenv
+faiss-cpu
+openai

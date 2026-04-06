@@ -1,0 +1,32 @@
+# ── Secrets — NEVER commit ───────────────────────────────────────────────────
+.env
+rag/.env
+*.env
+!*.env.example
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# ── Streamlit local secrets ───────────────────────────────────────────────────
+# The template is committed; the real file is never committed
+.streamlit/secrets.toml
+
+# ── Generated / log files ────────────────────────────────────────────────────
+*.log
+*.err
+rag/ingest_log.txt
+custom-agent/reports/
+
+# ── OS noise ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── IDE ────────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.codegpt/

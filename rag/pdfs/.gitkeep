@@ -1,0 +1,3 @@
+# Place product documentation PDF files here
+# These will be ingested into the RAG knowledge base by running: python ingest_all.py
+# Note: Markdown (.md) format in the docs/ folder produces better retrieval quality than PDFs

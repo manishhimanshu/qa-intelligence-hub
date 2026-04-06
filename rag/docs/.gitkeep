@@ -1,0 +1,8 @@
+# Place product documentation Markdown files here (.md format preferred)
+# These will be ingested into the RAG knowledge base by running: python ingest_all.py
+# 
+# Recommended content:
+#   - Role/permission matrix
+#   - Feature specifications per module
+#   - Field definitions and validation rules
+#   - Workflow and lifecycle docs (Content stages, Initiative status)
