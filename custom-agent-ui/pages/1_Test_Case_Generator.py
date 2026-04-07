@@ -29,7 +29,7 @@ load_dotenv(os.path.join(_DIR, "../../rag/.env"))
 
 # ── Config ────────────────────────────────────────────────────────────────────
 OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL        = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL        = os.getenv("OPENAI_MODEL", "gpt-4o")
 TESTRAIL_URL        = os.getenv("TESTRAIL_URL", "").rstrip("/")
 TESTRAIL_USER       = os.getenv("TESTRAIL_USER", "")
 TESTRAIL_TOKEN      = os.getenv("TESTRAIL_TOKEN", "")
@@ -464,26 +464,97 @@ def extract_comments(content: str) -> str:
 def extract_acceptance_criteria(content: str) -> list:
     """
     Extract Acceptance Criteria lines from structured story content.
-    Handles both markdown headings and plain labels.
+    Preserves group/parent context so sub-bullets carry their parent label.
+
+    Handles all common Jira AC formats:
+      1. Pure bullet/numbered lists           (- item, * item, 1. item)
+      2. ADF headings + bullets               (## Scenario → converted by _adf_to_markdown)
+      3. Colon-terminated labels + bullets    (Search behavior: → - bullet)
+      4. Plain short labels + bullets         (Some heading → * step)
+      5. Gherkin Given/When/Then/And/But      (always AC items, never headers)
+      6. Plain prose sentences                (The system should..., As an admin...)
+      7. Mixed formats within one AC field
     """
     ac, in_ac = [], False
-    _stop_sections = re.compile(
-        r'^(#{1,4}\s|definition of done|notes?:|out of scope|assumptions?|dependencies|steps to reproduce|---)',
+
+    _stop_named = re.compile(
+        r'^#{1,4}\s+(definition of done|notes?|out of scope|assumptions?|dependencies|steps to reproduce)',
         re.IGNORECASE,
     )
-    for line in content.splitlines():
-        s = line.strip()
+    _stop_unnumbered = re.compile(
+        r'^(definition of done|notes?:|out of scope|assumptions?|dependencies|steps to reproduce|---)',
+        re.IGNORECASE,
+    )
+    _md_heading   = re.compile(r'^#{1,4}\s+(.+)')
+    _colon_header = re.compile(r'^[^-*•\d].*:\s*$')          # ends with colon, no bullet
+    _bullet_start = re.compile(r'^[-*•]|^\d+\.')
+    _strip_bullet = re.compile(r'^[-*•]\s*|^\d+\.\s+')
+    _gherkin      = re.compile(r'^(Given|When|Then|And|But)\b', re.IGNORECASE)
+    _sentence_end = re.compile(r'[.?!]\s*$')                  # ends with sentence punctuation
+
+    lines = [ln.strip() for ln in content.splitlines()]
+    current_group = ""
+    i = 0
+
+    while i < len(lines):
+        s = lines[i]
+        i += 1
         if not s:
             continue
+
         if re.search(r'acceptance criteria', s, re.IGNORECASE):
             in_ac = True
+            current_group = ""
             continue
-        if in_ac:
-            if _stop_sections.match(s):
-                break
-            clean = re.sub(r'^[-*•]\s+|^\d+\.\s+', '', s).strip()
+
+        if not in_ac:
+            continue
+
+        # ── Section boundary ─────────────────────────────────────────────────
+        if _stop_named.match(s) or _stop_unnumbered.match(s):
+            break
+
+        # ── ADF-converted heading → group header ─────────────────────────────
+        m = _md_heading.match(s)
+        if m:
+            current_group = m.group(1).strip()
+            continue
+
+        # ── Gherkin keywords → always an AC item, never a header ─────────────
+        if _gherkin.match(s):
+            ac.append(f"{current_group}: {s}" if current_group else s)
+            continue
+
+        # ── Bullet / numbered item ────────────────────────────────────────────
+        if _bullet_start.match(s):
+            clean = _strip_bullet.sub('', s).strip()
             if clean:
-                ac.append(clean)
+                ac.append(f"{current_group}: {clean}" if current_group else clean)
+            continue
+
+        # ── Colon-terminated label → group header ─────────────────────────────
+        if _colon_header.match(s):
+            current_group = s.rstrip(':').strip()
+            continue
+
+        # ── Plain non-bullet line: decide header vs AC item ──────────────────
+        # Group header ONLY when ALL three conditions hold:
+        #   (a) short label (≤ 6 words) — typical section titles are terse
+        #   (b) no sentence-ending punctuation (. ? !)
+        #   (c) the NEXT non-empty line is a bullet/numbered item
+        # Everything else (long prose, sentences, short statements not followed
+        # by bullets) is treated directly as an AC item.
+        next_s = next((lines[j] for j in range(i, len(lines)) if lines[j]), "")
+        is_short_label = (
+            len(s.split()) <= 6
+            and not _sentence_end.search(s)
+            and _bullet_start.match(next_s)
+        )
+        if is_short_label:
+            current_group = s
+        else:
+            ac.append(f"{current_group}: {s}" if current_group else s)
+
     return ac
 
 
@@ -539,24 +610,43 @@ def generate_test_cases(
     selected_roles: tuple,
     feature_prefix: str,
 ) -> list:
+    # P1-fix: send only clean titles so GPT can identify duplicates reliably.
+    # Raw content (TestRail Case ID, Suite, Priority noise) wastes tokens and
+    # causes GPT to miss duplicate detection when only the title matches.
+    existing_titles = []
+    for tc in existing_tcs:
+        try:
+            raw_content = json.loads(tc).get("content", "")
+        except (json.JSONDecodeError, TypeError):
+            raw_content = tc if isinstance(tc, str) else ""
+        title_match = re.search(r'Title:\s*(.+)', raw_content)
+        if title_match:
+            existing_titles.append(title_match.group(1).strip()[:120])
     existing_block = (
-        "\n".join(
-            f"- {json.loads(tc).get('id','')}: "
-            + re.sub(r'<[^>]+>', '', re.sub(r'<br\s*/?>', ' ', json.loads(tc).get('content','')[:200]))
-            for tc in existing_tcs
-        )
-        or "None"
+        "\n".join(f"- {t}" for t in existing_titles) or "None"
     )
     desc_block = description.strip() or "Not provided."
+
+    # P1-fix: when AC is empty, extract numbered/bulleted items from Description
+    # so the per-AC coverage rules still apply to description-only stories
+    effective_ac = list(ac_list)
+    if not effective_ac and description.strip():
+        for line in description.splitlines():
+            s = line.strip()
+            clean = re.sub(r'^[-*•]\s+|^\d+\.\s+', '', s).strip()
+            if clean and len(clean) > 15:   # skip very short noise lines
+                effective_ac.append(clean)
+
     ac_fallback = (
         "No Acceptance Criteria found — infer test cases from the Description and Summary above."
-        if description.strip()
-        else "No AC found — infer test cases from the story summary."
+        if not effective_ac
+        else ""
     )
     ac_block = (
-        "\n".join(f"- {a}" for a in ac_list)
+        "\n".join(f"AC-{i:02d}: {a}" for i, a in enumerate(effective_ac, 1))
         or ac_fallback
     )
+    ac_count = len(effective_ac) or 1   # floor at 1 to avoid "AC-01 … AC-00" in prompt
     str_block = (
         "\n".join(f"{i}. {s}" for i, s in enumerate(str_list, 1))
         or "Not provided."
@@ -586,19 +676,48 @@ Acceptance Criteria:
 Steps to Reproduce (use these to inform negative/regression cases):
 {str_block}
 {comments_section}
+--- IMPORTANT: BEFORE generating test cases, first classify the AC items above ---
+AC items can be one of three types:
+  TYPE A — Distinct functional requirements: each item describes a SEPARATE testable behaviour
+            (e.g. "User can create a note", "User can delete a note", "Search is case-insensitive")
+            → Each TYPE A item MUST get its own dedicated test case.
+
+  TYPE B — Sequential implementation steps for ONE behaviour: items describe the ordered steps
+            to achieve a single outcome with no branching verification
+            (e.g. "1. Click Save  2. A spinner appears  3. Success toast shows")
+            → Group all TYPE B items into ONE test case that covers the full flow.
+            → List ALL expected outcomes as a numbered expected_result, e.g.:
+               "1. Spinner appears immediately. 2. Spinner disappears after save. 3. Success toast shown."
+
+  TYPE C — One flow with MULTIPLE independent verification points embedded in steps
+            (e.g. "When user submits: verify spinner shows AND verify audit log created AND verify email sent")
+            → Write ONE test case for the flow.
+            → List EVERY verification point in the expected_result field as a numbered list.
+            → Additionally, generate a separate NEGATIVE test case for each verification point
+               that can independently fail (e.g. "verifies audit log is NOT created when save fails").
+
+Apply this classification silently — do not output it. Use it to decide test case count and structure.
+The goal is COMPLETE coverage with no duplication and no missed verifications.
+
 Existing TestRail Test Cases (do NOT duplicate these):
 {existing_block}
 {cypress_section}
 Roles to cover: {roles_block}
 Feature prefix for TC IDs: {feature_prefix}
 
-Generate MISSING test cases covering ALL of the following:
-1. Happy path for each acceptance criterion
-2. Negative / validation cases (invalid data, missing required fields, wrong format)
-3. Role-based access: for each role — one case where they CAN act and one where they CANNOT (if applicable)
-4. Boundary values (max/min character limits, empty strings, date edge cases)
-5. Empty state (what does the user see when no data exists yet)
-6. Error handling (network failure, server error, concurrent edit)
+Generate MISSING test cases. There are {ac_count} numbered AC items above (AC-01 … AC-{ac_count:02d}).
+
+MANDATORY COVERAGE RULES — follow in order:
+1. AC COVERAGE (highest priority):
+   - For each TYPE A (distinct functional requirement) AC item: write ONE dedicated test case tagged with its AC number, e.g. "[AC-03] Search box shows cross icon only when text is entered".
+   - For grouped TYPE B (implementation steps) AC items: write ONE test case covering the full flow, tagged with the range, e.g. "[AC-05–AC-08] Saving a note shows spinner then success toast".
+   - Do NOT skip any AC item. Every AC-01 through AC-{ac_count:02d} must be referenced in at least one test case.
+2. NEGATIVE / VALIDATION: For each TYPE A AC item that involves a UI control, input field, or state change, also produce one negative case (invalid input, wrong state, boundary exceeded).
+3. ROLE-BASED (see role scoping rule below).
+4. EDGE CASES: Empty state, dependency deletion, concurrent edit, mid-workflow reload.
+5. ERROR HANDLING: Network failure, server 500, timeout.
+
+Do not stop early. Do not summarise. Every AC item must be covered.
 
 Return ONLY a valid JSON array — no markdown fences, no explanation:
 [
@@ -639,11 +758,35 @@ Rules:
         model=OPENAI_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
+        max_tokens=8000,
     )
     raw = resp.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw).strip()
-    return json.loads(raw)
+
+    # P1-fix: recover from truncated JSON — trim to last complete object
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        last_close = raw.rfind("},")
+        if last_close == -1:
+            last_close = raw.rfind("}")
+        if last_close != -1:
+            trimmed = raw[:last_close + 1].rstrip(",").strip()
+            if not trimmed.startswith("["):
+                trimmed = "[" + trimmed
+            trimmed += "]"
+            try:
+                cases = json.loads(trimmed)
+                st.warning(
+                    f"⚠️ GPT response was truncated — recovered {len(cases)} of the generated "
+                    "test cases. Consider re-generating or splitting into smaller stories.",
+                    icon="⚠️",
+                )
+                return cases
+            except json.JSONDecodeError:
+                pass
+        raise
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -661,15 +804,16 @@ def generate_bulk_test_cases(
 
     story_sections = []
     for s in stories:
-        ac_lines  = "\n".join(f"  - {a}" for a in s.get("ac_list", [])) or "  Not specified."
-        str_lines = "\n".join(f"  {i}. {step}" for i, step in enumerate(s.get("str_list", []), 1)) or "  Not specified."
+        ac_items   = s.get("ac_list", [])
+        ac_lines   = "\n".join(f"  AC-{i:02d}: {a}" for i, a in enumerate(ac_items, 1)) or "  Not specified."
+        str_lines  = "\n".join(f"  {i}. {step}" for i, step in enumerate(s.get("str_list", []), 1)) or "  Not specified."
         desc_text     = (s.get("desc", "") or "")[:800]
         comments_text = (s.get("comments", "") or "").strip()
         comments_line = f"\nComments: {comments_text[:600]}" if comments_text else ""
         story_sections.append(
             f"--- {s['key']}: {s['summary']} ---\n"
             f"Description: {desc_text or 'Not provided.'}\n"
-            f"Acceptance Criteria:\n{ac_lines}\n"
+            f"Acceptance Criteria ({len(ac_items)} items):\n{ac_lines}\n"
             f"Steps to Reproduce:\n{str_lines}"
             f"{comments_line}"
         )
@@ -696,6 +840,11 @@ def generate_bulk_test_cases(
         "4. Role-based access for the feature as a whole\n"
         "5. Edge cases: empty state, dependency deletion, concurrent edits, mid-flow reload\n"
         "6. Regression risk areas most likely to break if any story changes\n\n"
+        "AC TYPE CLASSIFICATION — apply this per-AC when deciding coverage:\n"
+        "  TYPE A (Explicit functional): AC describes exact UI action and measurable outcome → 1 positive + 1 negative\n"
+        "  TYPE B (Rule/constraint): AC describes a business rule, permission, or limit → 1 in-bounds + 1 boundary/limit test\n"
+        "  TYPE C (Non-functional): AC covers error messages, performance, UX, or display only → 1 positive (verify message/display)\n"
+        "You MUST produce at least one test case per AC item (AC-01 .. AC-N) across all stories listed.\n\n"
         "Return ONLY a valid JSON array — no markdown fences, no explanation:\n"
         "[\n"
         "  {\n"
@@ -842,17 +991,48 @@ def get_testrail_sections(suite_id: int) -> list:
 def export_to_testrail(cases: list, suite_id: int, section_id: int) -> list:
     results = []
     for case in cases:
-        # Build step objects — TestRail expects a list of {content, expected} dicts
         raw_steps = case.get("steps", "")
+        overall_expected = case.get("expected_result", "")
+
+        # P3-fix: parse "Step N: … \n  Expected: …" pairs produced by TYPE C prompt
+        # and assign per-step expected results instead of dumping everything on last step.
         step_objs = []
+        current_content = None
+        current_expected = ""
+        _step_re  = re.compile(r'^\s*(?:\d+\.\s*|Step\s*\d+:\s*)(.*)', re.IGNORECASE)
+        _exp_re   = re.compile(r'^\s*(?:Expected|Expected Result):\s*(.*)', re.IGNORECASE)
+
         for line in raw_steps.splitlines():
-            line = line.strip()
-            if not line:
+            s = line.strip()
+            if not s:
                 continue
-            clean = re.sub(r'^\d+\.\s*', '', line)
-            step_objs.append({"content": clean, "expected": ""})
-        if step_objs and case.get("expected_result"):
-            step_objs[-1]["expected"] = case["expected_result"]
+            m_step = _step_re.match(s)
+            m_exp  = _exp_re.match(s)
+            if m_step:
+                # Flush previous step
+                if current_content is not None:
+                    step_objs.append({"content": current_content, "expected": current_expected})
+                current_content  = m_step.group(1).strip()
+                current_expected = ""
+            elif m_exp and current_content is not None:
+                current_expected = m_exp.group(1).strip()
+            elif current_content is not None:
+                # Continuation line — append to current step content
+                current_content += " " + s
+
+        if current_content is not None:
+            step_objs.append({"content": current_content, "expected": current_expected})
+
+        # If no structured steps were found, fall back to plain split
+        if not step_objs and raw_steps.strip():
+            for line in raw_steps.splitlines():
+                clean = re.sub(r'^\d+\.\s*', '', line.strip())
+                if clean:
+                    step_objs.append({"content": clean, "expected": ""})
+
+        # Assign overall expected result to the last step if it has none
+        if step_objs and overall_expected and not step_objs[-1]["expected"]:
+            step_objs[-1]["expected"] = overall_expected
 
         payload = {
             "title":                  case["title"],
@@ -860,7 +1040,7 @@ def export_to_testrail(cases: list, suite_id: int, section_id: int) -> list:
             "priority_id":            TESTRAIL_PRIORITY.get(case.get("priority", "Medium"), 3),
             "custom_preconds":        case.get("preconditions", ""),
             "custom_steps_separated": step_objs,
-            "custom_expected":        case.get("expected_result", ""),
+            "custom_expected":        overall_expected,
             "refs":                   case.get("jira_ref", case.get("tc_id", "")),
             "suite_id":               suite_id,
         }
@@ -1340,8 +1520,34 @@ with tab3:
                     tuple(json.dumps(t, sort_keys=True) for t in ex_tcs),
                     tuple(sorted(selected_roles)), feature_prefix,
                 )
+                # P3-fix: flag near-duplicate titles within this generation run
+                # so the user can deselect before export (token overlap ≥ 70%)
+                def _title_tokens(t: str) -> set:
+                    return {w.lower().strip(".,;:!?()[]") for w in t.split() if len(w) > 2}
+
+                dup_indices: set = set()
+                for a in range(len(cases)):
+                    if a in dup_indices:
+                        continue
+                    for b in range(a + 1, len(cases)):
+                        if b in dup_indices:
+                            continue
+                        ta = _title_tokens(cases[a].get("title", ""))
+                        tb = _title_tokens(cases[b].get("title", ""))
+                        if ta and tb:
+                            overlap = len(ta & tb) / max(len(ta), len(tb))
+                            if overlap >= 0.70:
+                                dup_indices.add(b)
+                                cases[b]["_duplicate_of"] = cases[a].get("tc_id", str(a))
+
                 st.session_state[state_cases] = cases
-                st.session_state[state_sel]   = list(range(len(cases)))
+                st.session_state[state_sel]   = [i for i in range(len(cases)) if i not in dup_indices]
+                if dup_indices:
+                    st.warning(
+                        f"⚠️ {len(dup_indices)} near-duplicate case(s) detected and pre-deselected. "
+                        "Review them below before exporting.",
+                        icon="⚠️",
+                    )
             except Exception as e:
                 st.error(f"Generation failed: {e}")
 
@@ -1357,11 +1563,12 @@ with tab3:
             typ  = tc.get("type", "Functional")
             auto = tc.get("automation_status", "Manual")
 
+            _dup_tag = " ⚠️ NEAR-DUPLICATE" if tc.get("_duplicate_of") else ""
             checked = st.checkbox(
                 f"**[{tc.get('tc_id', f'{feature_prefix}-{i+1:03d}')}]** "
                 f"{PRIORITY_MAP.get(pri, '')} {pri}  |  "
                 f"{TYPE_MAP.get(typ, '')} {typ}  |  "
-                f"🤖 {auto}  —  {tc['title']}",
+                f"🤖 {auto}  —  {tc['title']}{_dup_tag}",
                 value=(i in st.session_state[state_sel]),
                 key=f"chk_{selected['key']}_{i}",
             )

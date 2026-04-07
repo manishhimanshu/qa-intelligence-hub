@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.join(_DIR, "../../rag"))
 load_dotenv(os.path.join(_DIR, "../../rag/.env"))
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o")
 JIRA_URL       = os.getenv("JIRA_URL", "").rstrip("/")
 JIRA_USER      = os.getenv("JIRA_USER", "")
 JIRA_TOKEN     = os.getenv("JIRA_TOKEN", "")

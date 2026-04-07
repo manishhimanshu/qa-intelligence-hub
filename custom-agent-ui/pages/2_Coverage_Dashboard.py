@@ -119,21 +119,20 @@ def build_testrail_index() -> list:
     return cases
 
 
-def check_story_coverage(story_key: str, summary: str) -> dict:
+def check_story_coverage(story_key: str, summary: str, ac_count: int = 0) -> dict:
     """
     Check TestRail coverage by keyword matching across ALL indexed cases.
 
     Strategy (in priority order):
     1. Jira story key appears literally in the TestRail case content (most reliable)
     2. Significant words from the story summary appear in the case title/content
-       (handles cases where the Jira key isn't referenced but the feature is)
 
-    This replaces the old FAISS top_k=12 similarity search which missed >80% of
-    valid matches due to the hard cap and semantic vocabulary mismatches.
+    Coverage status is AC-count-aware:
+    - If ac_count known: Covered ≥70% TCs/ACs, Partial 1–69%, No Coverage 0
+    - If ac_count unknown: Covered ≥3, Partial 1–2, No Coverage 0
     """
     tr_cases = build_testrail_index()
     if not tr_cases:
-        # Fallback to old similarity method if index empty
         docs = rag_query(f"{story_key} {summary}", top_k=30)
         tcs  = []
         for doc in docs:
@@ -142,50 +141,69 @@ def check_story_coverage(story_key: str, summary: str) -> dict:
                 m = re.search(r'testrail_(\d+)', doc_id)
                 tcs.append(f"C{m.group(1)}" if m else doc_id)
         tc_count = len(tcs)
-        coverage = "Covered" if tc_count >= 2 else "Partial" if tc_count == 1 else "No Coverage"
+        coverage = _coverage_status(tc_count, ac_count)
         return {"test_cases": tcs, "tc_count": tc_count, "coverage": coverage}
 
     story_key_lower = story_key.lower()
 
-    # Build keyword set from summary — strip short/common words
-    stop = {"a","an","the","and","or","of","to","in","is","it","for","with",
-            "as","at","by","on","be","that","this","can","are","was","has","have",
-            "not","but","when","from","they","its","all","been","will","would",
-            "should","could","there","their","which","than","into","more","also"}
+    # High-frequency domain words that appear in almost every TestRail case —
+    # matching on these alone creates massive false-positive rate
+    domain_noise = {
+        "content", "user", "page", "item", "list", "view", "data", "text",
+        "button", "click", "open", "show", "display", "create", "update",
+        "delete", "load", "save", "edit", "form", "field", "table", "search",
+        "filter", "result", "title", "name", "type", "status", "error",
+        "message", "modal", "dialog", "popup", "panel", "section", "admin",
+    }
+    stop = {
+        "a","an","the","and","or","of","to","in","is","it","for","with",
+        "as","at","by","on","be","that","this","can","are","was","has","have",
+        "not","but","when","from","they","its","all","been","will","would",
+        "should","could","there","their","which","than","into","more","also",
+    }
+
     summary_words = [
         w.lower().strip(".,;:!?()[]'\"")
         for w in summary.split()
-        if len(w) > 3 and w.lower().strip(".,;:!?()[]'\"") not in stop
+        if len(w) > 3
+        and w.lower().strip(".,;:!?()[]'\"") not in stop
+        and w.lower().strip(".,;:!?()[]'\"") not in domain_noise
     ]
-    # Keep up to 8 most distinctive (longest) words
-    keyword_set = sorted(set(summary_words), key=len, reverse=True)[:8]
+    # Keep up to 6 most distinctive (longest) non-noise words
+    keyword_set = sorted(set(summary_words), key=len, reverse=True)[:6]
+
+    # Raise thresholds dynamically based on keyword count to reduce false positives:
+    # short summaries (1-2 meaningful words) need 100% match; longer can use 60%
+    kw_len = len(keyword_set)
+    if kw_len <= 2:
+        title_thresh   = kw_len       # all keywords must match title
+        content_thresh = kw_len       # all keywords must appear in content
+    else:
+        title_thresh   = max(2, round(kw_len * 0.6))
+        content_thresh = max(3, round(kw_len * 0.7))
 
     matched_ids = []
     for case in tr_cases:
         content = case["content"]
         title   = case["title"]
 
-        # Priority 1: story key mentioned directly (e.g. "STUD-17260")
+        # Priority 1: story key mentioned directly (most reliable)
         if story_key_lower in content:
             matched_ids.append(case["id"])
             continue
 
-        # Priority 2: keyword match
-        # Check title separately (higher weight — title is more precise)
-        if keyword_set:
-            title_hits   = sum(1 for kw in keyword_set if kw in title)
-            content_hits = sum(1 for kw in keyword_set if kw in content)
+        if not keyword_set:
+            continue
 
-            # Strong title match: ≥40% of keywords in the title alone
-            title_threshold = max(1, round(len(keyword_set) * 0.4))
-            if title_hits >= title_threshold:
-                matched_ids.append(case["id"])
-                continue
+        title_hits   = sum(1 for kw in keyword_set if kw in title)
+        content_hits = sum(1 for kw in keyword_set if kw in content)
 
-            # Content match: ≥50% of keywords appear anywhere in the content
-            content_threshold = max(2, round(len(keyword_set) * 0.5))
-            if content_hits >= content_threshold:
-                matched_ids.append(case["id"])
+        if title_hits >= title_thresh:
+            matched_ids.append(case["id"])
+            continue
+
+        if content_hits >= content_thresh:
+            matched_ids.append(case["id"])
 
     tcs = []
     for doc_id in matched_ids:
@@ -193,15 +211,53 @@ def check_story_coverage(story_key: str, summary: str) -> dict:
         tcs.append(f"C{m.group(1)}" if m else doc_id)
 
     tc_count = len(tcs)
-    coverage = "Covered" if tc_count >= 2 else "Partial" if tc_count == 1 else "No Coverage"
+    coverage = _coverage_status(tc_count, ac_count)
     return {"test_cases": tcs, "tc_count": tc_count, "coverage": coverage}
+
+
+def _coverage_status(tc_count: int, ac_count: int) -> str:
+    """
+    Determine coverage status, weighted by known AC count when available.
+    Without AC count we fall back to simple absolute thresholds.
+    """
+    if ac_count > 0:
+        ratio = tc_count / ac_count
+        if ratio >= 0.7:
+            return "Covered"
+        elif tc_count >= 1:
+            return "Partial"
+        else:
+            return "No Coverage"
+    else:
+        # Fallback: story with no AC metadata — use absolute count
+        if tc_count >= 3:
+            return "Covered"
+        elif tc_count >= 1:
+            return "Partial"
+        else:
+            return "No Coverage"
 
 
 def build_coverage_matrix(stories: list, progress_bar) -> list:
     matrix = []
     for i, story in enumerate(stories):
         progress_bar.progress((i + 1) / len(stories), text=f"Checking {story['key']}…")
-        cov = check_story_coverage(story["key"], story["summary"])
+        # Estimate AC count from RAG content to weight coverage thresholds
+        ac_count = 0
+        content = story.get("content", "")
+        if content:
+            in_ac = False
+            for line in content.splitlines():
+                s = line.strip()
+                if re.search(r'acceptance criteria', s, re.IGNORECASE):
+                    in_ac = True
+                    continue
+                if in_ac:
+                    if re.match(r'^(#{1,4}\s|steps to reproduce|definition of done|---)', s, re.IGNORECASE):
+                        break
+                    if re.match(r'^[-*•]|^\d+\.', s):
+                        ac_count += 1
+        cov = check_story_coverage(story["key"], story["summary"], ac_count)
         matrix.append({
             "jira_key":   story["key"],
             "summary":    story["summary"],
@@ -209,6 +265,7 @@ def build_coverage_matrix(stories: list, progress_bar) -> list:
             "status":     story["status"],
             "test_cases": cov["test_cases"],
             "tc_count":   cov["tc_count"],
+            "ac_count":   ac_count,
             "coverage":   cov["coverage"],
         })
     return matrix
@@ -392,6 +449,53 @@ def build_excel_report(matrix: list) -> bytes:
 st.title("📊 Coverage Dashboard")
 st.caption("Jira ↔ TestRail traceability matrix — run for all stories, specific stories, or a full epic")
 
+# ── Staleness banner ──────────────────────────────────────────────────────────
+def _show_staleness_banner():
+    import json as _json
+    from datetime import datetime, timezone, timedelta
+    _rag_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../rag")
+    _meta_path = os.path.join(
+        _rag_dir,
+        os.getenv("FAISS_INDEX_PATH", "faiss_index").strip("./"),
+        "metadata.json",
+    )
+    if not os.path.exists(_meta_path):
+        st.info(
+            "ℹ️ No ingest timestamp found. Re-run `python rag/ingest_all.py` to refresh "
+            "the knowledge base and enable staleness tracking.",
+            icon="ℹ️",
+        )
+        return
+    try:
+        with open(_meta_path) as f:
+            meta = _json.load(f)
+        built_at = datetime.fromisoformat(meta["built_at"])
+        age_days = (datetime.now(timezone.utc) - built_at).days
+        doc_count = meta.get("doc_count", "unknown")
+        age_str = f"{age_days} day{'s' if age_days != 1 else ''} ago"
+        if age_days > 14:
+            st.warning(
+                f"⚠️ Knowledge base last updated **{age_str}** ({built_at.strftime('%Y-%m-%d')}, "
+                f"{doc_count} docs). Coverage data may be stale — re-run `python rag/ingest_all.py`.",
+                icon="⚠️",
+            )
+        elif age_days > 7:
+            st.info(
+                f"ℹ️ Knowledge base last updated **{age_str}** ({built_at.strftime('%Y-%m-%d')}, "
+                f"{doc_count} docs). Consider re-ingesting after each sprint.",
+                icon="ℹ️",
+            )
+        else:
+            st.success(
+                f"✅ Knowledge base is current — last updated **{age_str}** "
+                f"({built_at.strftime('%Y-%m-%d')}, {doc_count} docs).",
+                icon="✅",
+            )
+    except Exception:
+        pass
+
+_show_staleness_banner()
+
 all_stories = load_all_stories()
 if not all_stories:
     st.error("No Jira stories found in RAG. Run `python rag/ingest_all.py`.")
@@ -564,6 +668,7 @@ df = pd.DataFrame([
         "Summary":    r["summary"],
         "Type":       r["issuetype"],
         "Status":     r["status"],
+        "ACs":        r.get("ac_count", 0) or "—",
         "TC Count":   r["tc_count"],
         "Test Cases": ", ".join(r["test_cases"]) or "—",
         "Coverage":   COVERAGE_ICONS.get(r["coverage"], r["coverage"]),

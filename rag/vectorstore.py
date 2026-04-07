@@ -1,4 +1,6 @@
 import os
+import json
+from datetime import datetime, timezone
 from typing import List, Dict
 
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -59,5 +61,12 @@ def build_vectorstore(docs: List[Dict], persist: bool = True) -> FAISS:
         if persist:
             os.makedirs(os.path.dirname(os.path.abspath(FAISS_INDEX_PATH)), exist_ok=True)
             vs.save_local(FAISS_INDEX_PATH)
+            # Write ingest timestamp so the app can show a staleness warning
+            meta_path = os.path.join(FAISS_INDEX_PATH, "metadata.json")
+            with open(meta_path, "w") as f:
+                json.dump({
+                    "built_at": datetime.now(timezone.utc).isoformat(),
+                    "doc_count": len(texts),
+                }, f)
 
     return vs
