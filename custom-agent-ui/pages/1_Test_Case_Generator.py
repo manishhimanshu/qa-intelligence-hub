@@ -670,60 +670,54 @@ Jira Story: {story_key} — {summary}
 Description:
 {desc_block}
 
-Acceptance Criteria:
+Acceptance Criteria ({ac_count} items — each MUST be covered):
 {ac_block}
 
-Steps to Reproduce (use these to inform negative/regression cases):
+Steps to Reproduce (use to inform negative/regression cases):
 {str_block}
 {comments_section}
---- IMPORTANT: BEFORE generating test cases, first classify the AC items above ---
-AC items can be one of three types:
-  TYPE A — Distinct functional requirements: each item describes a SEPARATE testable behaviour
-            (e.g. "User can create a note", "User can delete a note", "Search is case-insensitive")
-            → Each TYPE A item MUST get its own dedicated test case.
-
-  TYPE B — Sequential implementation steps for ONE behaviour: items describe the ordered steps
-            to achieve a single outcome with no branching verification
-            (e.g. "1. Click Save  2. A spinner appears  3. Success toast shows")
-            → Group all TYPE B items into ONE test case that covers the full flow.
-            → List ALL expected outcomes as a numbered expected_result, e.g.:
-               "1. Spinner appears immediately. 2. Spinner disappears after save. 3. Success toast shown."
-
-  TYPE C — One flow with MULTIPLE independent verification points embedded in steps
-            (e.g. "When user submits: verify spinner shows AND verify audit log created AND verify email sent")
-            → Write ONE test case for the flow.
-            → List EVERY verification point in the expected_result field as a numbered list.
-            → Additionally, generate a separate NEGATIVE test case for each verification point
-               that can independently fail (e.g. "verifies audit log is NOT created when save fails").
-
-Apply this classification silently — do not output it. Use it to decide test case count and structure.
-The goal is COMPLETE coverage with no duplication and no missed verifications.
-
 Existing TestRail Test Cases (do NOT duplicate these):
 {existing_block}
 {cypress_section}
 Roles to cover: {roles_block}
 Feature prefix for TC IDs: {feature_prefix}
 
-Generate MISSING test cases. There are {ac_count} numbered AC items above (AC-01 … AC-{ac_count:02d}).
+══════════════════════════════════════════════════════
+COVERAGE MANDATE
+══════════════════════════════════════════════════════
+There are {ac_count} AC items above (AC-01 … AC-{ac_count:02d}).
 
-MANDATORY COVERAGE RULES — follow in order:
-1. AC COVERAGE (highest priority):
-   - For each TYPE A (distinct functional requirement) AC item: write ONE dedicated test case tagged with its AC number, e.g. "[AC-03] Search box shows cross icon only when text is entered".
-   - For grouped TYPE B (implementation steps) AC items: write ONE test case covering the full flow, tagged with the range, e.g. "[AC-05–AC-08] Saving a note shows spinner then success toast".
-   - Do NOT skip any AC item. Every AC-01 through AC-{ac_count:02d} must be referenced in at least one test case.
-2. NEGATIVE / VALIDATION: For each TYPE A AC item that involves a UI control, input field, or state change, also produce one negative case (invalid input, wrong state, boundary exceeded).
-3. ROLE-BASED (see role scoping rule below).
-4. EDGE CASES: Empty state, dependency deletion, concurrent edit, mid-workflow reload.
-5. ERROR HANDLING: Network failure, server 500, timeout.
+STEP 1 — PER-AC CASES (do this first, in order):
+  Write one dedicated positive test case per AC item.
+  Tag each title: "[AC-XX] <what is being verified>"
+  Example: "[AC-05] Search box displays cross icon only when text is entered"
 
-Do not stop early. Do not summarise. Every AC item must be covered.
+  ONLY group multiple AC items into one test case when they are literally
+  sub-steps of the exact same indivisible user action
+  (e.g. "1. Click Save → 2. Spinner shows → 3. Toast appears" = one flow).
+  Even then, every AC number in the group must appear in the title tag.
+  When in doubt — do NOT group. Give each item its own test case.
+
+STEP 2 — NEGATIVE CASES:
+  For every AC item that involves a UI control, an input field, a conditional
+  display rule, or a state change — write one negative/boundary test case.
+  Tag: "[AC-XX – Negative] <what fails or is invalid>"
+
+STEP 3 — SUPPLEMENTARY (add after all per-AC cases):
+  - 1–3 role permission cases: contributor and consumer trying to use the feature
+  - 1–2 edge cases: empty state, dependency deletion, concurrent edit, reload
+  - 1 error-handling case: network failure or server 500
+
+Expected output range: {ac_count} to {ac_count * 2} test cases.
+If you are producing fewer than {ac_count} cases you are grouping too aggressively — stop and revise.
+Do NOT stop generating until every AC-01 through AC-{ac_count:02d} is covered.
+══════════════════════════════════════════════════════
 
 Return ONLY a valid JSON array — no markdown fences, no explanation:
 [
   {{
     "tc_id":             "{feature_prefix}-001",
-    "title":             "[Action] [Object] verifies [Expected Outcome]",
+    "title":             "[AC-XX] [Action] [Object] verifies [Expected Outcome]",
     "priority":          "Critical|High|Medium|Low",
     "type":              "Functional|Regression|Smoke|Integration|Negative",
     "preconditions":     "Role required, existing data state, feature flags if any",
@@ -736,29 +730,24 @@ Return ONLY a valid JSON array — no markdown fences, no explanation:
 ]
 
 Rules:
-- Use sequential IDs: {feature_prefix}-001, {feature_prefix}-002, etc.
-- Priority: Critical = core login/data-loss flows, High = main feature flows,
-            Medium = edge cases, Low = cosmetic/informational
-- automation_status = "Candidate" for stable repeatable flows,
-                      "Manual" for exploratory or one-off,
-                      "Automated" if it clearly maps to an existing Cypress pattern
+- Sequential IDs: {feature_prefix}-001, {feature_prefix}-002, etc.
+- Priority: Critical = core/data-loss, High = main flows, Medium = edge cases, Low = cosmetic
+- automation_status: "Candidate" for stable repeatable flows, "Manual" for exploratory,
+  "Automated" if it clearly maps to an existing Cypress pattern
 - Always prefix test data with "CY_Test |"
-- Generate at minimum one negative case per acceptance criterion
 - ROLE SCOPING RULE:
-  ALWAYS generate:
-    - At least one negative case for contributor (cannot perform write/admin actions on this feature)
-    - At least one negative case for consumer (cannot perform write/admin/editor actions on this feature)
-  Generate FULL additional role-specific flows ONLY when:
-    a) The story explicitly names a role (e.g. "admin can...", "editor should not..."), OR
-    b) The feature clearly behaves differently between the roles listed above.
-  Do NOT duplicate the full happy-path flow per role — role cases must focus on access-control
-  boundaries (403 / permission denied / feature hidden). When in doubt, use admin for positive flows."""
+  ALWAYS include at least one negative case for contributor and one for consumer
+  (cannot perform write/admin actions). Generate full role-specific flows ONLY when
+  the story explicitly names a role or behaviour clearly differs by role.
+  Do NOT duplicate the full happy-path per role — role cases must focus on
+  access-control boundaries (403 / permission denied / feature hidden).
+  When in doubt, use admin for positive flows."""
 
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
-        max_tokens=8000,
+        max_tokens=16000,
     )
     raw = resp.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
