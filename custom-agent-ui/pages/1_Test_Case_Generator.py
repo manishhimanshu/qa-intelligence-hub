@@ -482,7 +482,7 @@ def extract_acceptance_criteria(content: str) -> list:
         re.IGNORECASE,
     )
     _stop_unnumbered = re.compile(
-        r'^(definition of done|notes?:|out of scope|assumptions?|dependencies|steps to reproduce|---)',
+        r'^(definition of done|notes?:|out of scope|assumptions?|dependencies|steps to reproduce)',
         re.IGNORECASE,
     )
     _md_heading   = re.compile(r'^#{1,4}\s+(.+)')
@@ -562,7 +562,7 @@ def extract_steps_to_reproduce(content: str) -> list:
     """Extract Steps to Reproduce lines from structured story content."""
     steps, in_steps = [], False
     _stop_sections = re.compile(
-        r'^(#{1,4}\s|acceptance criteria|definition of done|notes?:|out of scope|---)',
+        r'^(#{1,4}\s|acceptance criteria|definition of done|notes?:|out of scope)',
         re.IGNORECASE,
     )
     for line in content.splitlines():
