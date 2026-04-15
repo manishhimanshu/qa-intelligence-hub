@@ -983,11 +983,6 @@ def export_to_testrail(cases: list, suite_id: int, section_id: int) -> list:
         raw_steps = case.get("steps", "")
         overall_expected = case.get("expected_result", "")
 
-        # Normalise step separators: GPT often encodes newlines as literal \n in
-        # the JSON string value. json.loads() keeps them as the two-char sequence
-        # "\n" rather than a real newline, so splitlines() sees one long line.
-        raw_steps = raw_steps.replace("\\n", "\n")
-
         # P3-fix: parse "Step N: … \n  Expected: …" pairs and assign per-step
         # expected results instead of dumping everything on the last step.
         step_objs = []
@@ -1024,21 +1019,16 @@ def export_to_testrail(cases: list, suite_id: int, section_id: int) -> list:
                 if clean:
                     step_objs.append({"content": clean, "expected": ""})
 
-        # Build plain-text steps string for sections using the "Test Case (Text)" template.
-        # TestRail silently ignores custom_steps_separated when the section template is
-        # "Test Case (Text)" — sending custom_steps as well ensures steps are always saved.
-        plain_steps = "\n".join(
-            f"{i}. {obj['content']}" + (f"\n   Expected: {obj['expected']}" if obj.get("expected") else "")
-            for i, obj in enumerate(step_objs, 1)
-        )
+        # Assign overall expected result to the last step if it has none
+        if step_objs and overall_expected and not step_objs[-1]["expected"]:
+            step_objs[-1]["expected"] = overall_expected
 
         payload = {
             "title":                  case["title"],
             "type_id":                1,
             "priority_id":            TESTRAIL_PRIORITY.get(case.get("priority", "Medium"), 3),
             "custom_preconds":        case.get("preconditions", ""),
-            "custom_steps_separated": step_objs,   # for "Test Case (Steps)" template
-            "custom_steps":           plain_steps,  # for "Test Case (Text)" template
+            "custom_steps_separated": step_objs,
             "custom_expected":        overall_expected,
             "refs":                   case.get("jira_ref", case.get("tc_id", "")),
             "suite_id":               suite_id,
