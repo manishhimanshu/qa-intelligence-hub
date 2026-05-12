@@ -215,7 +215,7 @@ def get_story_content(story_key: str, fallback: str) -> str:
 @st.cache_data(show_spinner=False, ttl=3600)
 def run_gap_analysis(story_key: str, summary: str, content: str) -> dict:
     """Call GPT to produce the 5-section gap analysis from instructions."""
-    prompt = f"""You are a QA Architect performing a structured Requirement Gap Analysis for a Kapost/Pilyr Jira story.
+    prompt = f"""You are a QA Architect performing a structured Requirement Gap Analysis for a Kapost Jira story.
 
 Platform context:
 - B2B content marketing SaaS
@@ -290,7 +290,7 @@ Produce a COMPLETE gap analysis. Return ONLY valid JSON — no markdown fences:
   }}
 }}
 
-Be specific and reference Kapost/Pilyr domain concepts.
+Be specific and reference Kapost domain concepts.
 Flag anything not covered in the requirement as a gap — do not assume it is handled."""
 
     resp = client.chat.completions.create(
@@ -435,7 +435,7 @@ def run_multi_gap_analysis(stories_data: tuple) -> dict:
         stories_block += story["content"] + "\n"
 
     n = len(stories_list)
-    prompt = f"""You are a QA Architect performing a consolidated Requirement Gap Analysis for a Kapost/Pilyr feature consisting of {n} Jira story/stories.
+    prompt = f"""You are a QA Architect performing a consolidated Requirement Gap Analysis for a Kapost feature consisting of {n} Jira story/stories.
 
 Platform context:
 - B2B content marketing SaaS

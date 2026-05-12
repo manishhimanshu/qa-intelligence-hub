@@ -1,6 +1,6 @@
 # QA Intelligence Hub
 
-An internal AI-powered tool that automates test case generation, coverage analysis, and requirement gap analysis for the Kapost/Pilyr platform.
+An internal AI-powered tool that automates test case generation, coverage analysis, and requirement gap analysis for the Kapost platform.
 
 > **Full documentation:** [QA_Intelligence_Hub_Documentation.md](QA_Intelligence_Hub_Documentation.md)
 
