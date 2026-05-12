@@ -35,7 +35,7 @@ st.set_page_config(
 
 # ── Header ───────────────────────────────────────────────────────────────────
 st.title("🧪 QA Intelligence Hub")
-st.caption("Powered by RAG · GPT-4o · Jira · TestRail  |  Kapost / Pilyr QA Suite")
+st.caption("Powered by RAG · GPT-4o · Jira · TestRail  |  Kapost QA Suite")
 st.divider()
 
 # ── Feature navigation cards ─────────────────────────────────────────────────

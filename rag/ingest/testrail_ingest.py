@@ -1,5 +1,5 @@
 """
-TestRail ingestion for Kapost/Pilyr.
+TestRail ingestion for Kapost.
 Fetches test cases across all suites in the project, enriched with
 suite name, section name, steps, and expected results.
 

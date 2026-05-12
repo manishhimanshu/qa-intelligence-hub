@@ -1,7 +1,7 @@
 """
 Test Case Generator
 Generates structured manual test cases from Jira stories following
-Kapost/Pilyr test-cases.instructions.md format:
+Kapost test-cases.instructions.md format:
   - TC-FEATURE-NNN IDs with Priority, Type, Steps, Expected Result
   - Role-based test cases (admin / editor / contributor / consumer)
   - Exports directly to TestRail
@@ -66,7 +66,8 @@ TYPE_MAP     = {
     "Integration": "🔗",
     "Negative":    "❌",
 }
-TESTRAIL_PRIORITY = {"Critical": 1, "High": 2, "Medium": 3, "Low": 4}
+# 5=Base level test, 4=Regression level, 3=Functional, 2=Edge case, 1=Don't Test
+TESTRAIL_PRIORITY = {"Critical": 5, "High": 3, "Medium": 2, "Low": 1}
 
 # ── Edit helper ───────────────────────────────────────────────────────────────
 _PRIS  = ["Critical", "High", "Medium", "Low"]
@@ -332,21 +333,25 @@ def get_story_content(story_key: str, rag_content: str) -> str:
 
 @st.cache_data(show_spinner="Finding existing TestRail test cases…")
 def get_existing_test_cases(story_key: str, summary: str) -> list:
-    # top_k=40 so we search a wider slice of the 4,105 TestRail chunks;
-    # only TestRail docs are kept, so the prompt stays lean.
-    docs = rag_query(f"{story_key} {summary}", top_k=40)
+    # top_k=15: narrow the candidate set to reduce semantically-similar-but-unrelated cases.
+    docs = rag_query(f"{story_key} {summary}", top_k=15)
 
     # Aggregate ALL chunks per case (cases can be split across multiple 800-char chunks)
     case_chunks: dict = {}   # case_id → list of content strings
-    for doc in docs:
+    for rank, doc in enumerate(docs):
         doc_id = doc.get("id", "")
         if not doc_id.startswith("testrail_"):
             continue
+        content = doc.get("content", "")
+        # Accept only if: (a) story key appears in the indexed content (definite link),
+        # OR (b) it is in the top 5 semantic results (high-confidence similarity).
+        # This filters out loosely-related cases from unrelated stories.
+        if story_key not in content and rank >= 5:
+            continue
         m = re.search(r'testrail_(\d+)', doc_id)
         case_id = f"C{m.group(1)}" if m else doc_id
-        raw = doc.get("content", "")
         # Strip HTML inline
-        clean = re.sub(r'<br\s*/?>', '\n', raw)
+        clean = re.sub(r'<br\s*/?>', '\n', content)
         clean = re.sub(r'<[^>]+>', '', clean)
         # Strip literal string "None" values left by TestRail for empty fields
         clean = re.sub(r'(?m)^(Preconditions|Expected Result):\s*None\s*$', '', clean)
@@ -401,6 +406,68 @@ def get_cypress_patterns(summary: str, top_k: int = 5) -> str:
         if len(patterns) >= top_k:
             break
     return "\n\n".join(patterns)
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def get_role_context(summary: str, feature_prefix: str) -> str:
+    """
+    Retrieve role-permission context from the RAG index for this feature area.
+    Queries for:
+      1. The universal role rules section (always included)
+      2. The feature-specific role section (matched by summary + feature prefix)
+
+    The role-permissions.md doc is split by heading, so each section is
+    a separate FAISS chunk.  We filter to docs sourced from that file and
+    cap the total at ~1200 chars so it doesn't bloat the generation prompt.
+    """
+    # Build a query that targets both universal rules and the specific feature
+    query = f"role permissions {feature_prefix} {summary}"
+    docs  = rag_query(query, top_k=30)
+
+    universal_chunk   = None
+    access_level_chunk = None
+    feature_chunk     = None
+    seen_ids: set     = set()
+
+    for doc in docs:
+        src     = doc.get("source", "")
+        content = doc.get("content", "").strip()
+        doc_id  = doc.get("id", "")
+        if doc_id in seen_ids:
+            continue
+        # Only use docs from the role-permissions markdown
+        if "role-permissions" not in src.lower():
+            continue
+        seen_ids.add(doc_id)
+
+        heading = doc.get("heading", content[:60]).lower()
+        if "universal" in heading:
+            universal_chunk = content[:700]
+        elif "object-level" in heading or "manage access" in heading or "owner access" in heading:
+            access_level_chunk = content[:700]
+        elif not feature_chunk:
+            # Only accept as feature-specific if the feature prefix or at least one
+            # meaningful word from the summary appears in the chunk heading or content.
+            # This prevents a high-ranking but wrong section (e.g. Gallery) from being
+            # used as context for a Calendar or Canvas feature.
+            summary_keywords = {
+                w.lower() for w in re.split(r'\W+', summary) if len(w) > 3
+            }
+            prefix_keywords  = {w.lower() for w in re.split(r'\W+', feature_prefix) if w}
+            candidate_text   = (heading + " " + content[:600]).lower()
+            if prefix_keywords & set(re.split(r'\W+', candidate_text)) or \
+               summary_keywords & set(re.split(r'\W+', candidate_text)):
+                feature_chunk = content[:400]
+
+    parts = []
+    if universal_chunk:
+        parts.append(universal_chunk)
+    if access_level_chunk:
+        parts.append(access_level_chunk)
+    if feature_chunk:
+        parts.append(feature_chunk)
+
+    return "\n\n".join(parts)
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
@@ -494,6 +561,7 @@ def extract_acceptance_criteria(content: str) -> list:
 
     lines = [ln.strip() for ln in content.splitlines()]
     current_group = ""
+    extract_acceptance_criteria._gherkin_buf = []  # reset per-call scenario buffer
     i = 0
 
     while i < len(lines):
@@ -520,9 +588,26 @@ def extract_acceptance_criteria(content: str) -> list:
             current_group = m.group(1).strip()
             continue
 
-        # ── Gherkin keywords → always an AC item, never a header ─────────────
+        # ── Gherkin keywords → accumulate into a full scenario, one AC per Given block
+        # Each Given…When…Then…And…But block = ONE scenario = ONE AC item.
+        # Individual keyword lines are NOT separate requirements.
         if _gherkin.match(s):
-            ac.append(f"{current_group}: {s}" if current_group else s)
+            # If this is a new 'Given', flush any in-progress scenario first
+            if re.match(r'^Given\b', s, re.IGNORECASE):
+                if hasattr(extract_acceptance_criteria, '_gherkin_buf') and extract_acceptance_criteria._gherkin_buf:
+                    scenario = " / ".join(extract_acceptance_criteria._gherkin_buf)
+                    ac.append(f"{current_group}: {scenario}" if current_group else scenario)
+                extract_acceptance_criteria._gherkin_buf = [s]
+            else:
+                if not hasattr(extract_acceptance_criteria, '_gherkin_buf'):
+                    extract_acceptance_criteria._gherkin_buf = []
+                extract_acceptance_criteria._gherkin_buf.append(s)
+            continue
+
+        # ── Horizontal rule — skip without stopping or adding as AC item ────────
+        # '---' starts with '-' so _bullet_start would match it and produce
+        # a spurious '--' AC item, inflating ac_count and confusing GPT coverage.
+        if re.match(r'^-{2,}$', s):
             continue
 
         # ── Bullet / numbered item ────────────────────────────────────────────
@@ -554,6 +639,12 @@ def extract_acceptance_criteria(content: str) -> list:
             current_group = s
         else:
             ac.append(f"{current_group}: {s}" if current_group else s)
+
+    # Flush any trailing Gherkin scenario that didn't hit a boundary
+    if extract_acceptance_criteria._gherkin_buf:
+        scenario = " / ".join(extract_acceptance_criteria._gherkin_buf)
+        ac.append(f"{current_group}: {scenario}" if current_group else scenario)
+        extract_acceptance_criteria._gherkin_buf = []
 
     return ac
 
@@ -597,6 +688,228 @@ def extract_description(content: str) -> str:
     return "\n".join(desc).strip()
 
 
+def normalize_ticket(
+    story_key: str,
+    summary: str,
+    description: str,
+    ac_list: tuple,
+    str_list: tuple,
+    comments: str,
+    ticket_type: str = "Story",
+) -> dict:
+    """
+    Convert raw Jira fields into a canonical schema before LLM processing.
+    Applies Kapost conventions:
+      Story: AC → requirements, Description → dev notes/context
+      Bug:   STR → test flow, Description → root cause hints
+    Returns a dict that is stable, hashable-friendly, and passed to LLM steps.
+    """
+    ac    = list(ac_list)
+    steps = list(str_list)
+
+    # Determine primary source following the same priority as generate_test_cases
+    if ac:
+        primary_source = "ac"
+        requirements   = ac
+    elif steps:
+        primary_source = "str"
+        requirements   = steps
+    elif description.strip():
+        primary_source = "description"
+        requirements   = [
+            re.sub(r'^[-*•]\s+|^\d+\.\s+', '', ln.strip()).strip()
+            for ln in description.splitlines()
+            if len(re.sub(r'^[-*•]\s+|^\d+\.\s+', '', ln.strip()).strip()) > 15
+        ]
+    else:
+        primary_source = "none"
+        requirements   = []
+
+    return {
+        "ticket_key":     story_key,
+        "ticket_type":    ticket_type,
+        "summary":        summary,
+        "primary_source": primary_source,   # "ac" | "str" | "description" | "none"
+        "requirements":   requirements,     # authoritative list, source-agnostic
+        "steps_to_reproduce": steps,        # always preserved separately
+        "description_notes":  description.strip(),
+        "comments":           comments.strip(),
+    }
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def extract_requirements(
+    ticket_json: str,   # JSON-serialised normalised ticket (hashable for cache)
+    cypress_context: str,
+    existing_tcs_json: str,
+    role_context: str = "",  # role-permission context from RAG
+) -> dict:
+    """
+    Pipeline Step 1 — LLM analyses the normalised ticket and returns:
+      - functional_requirements: refined, unambiguous requirement statements
+      - edge_cases:              boundary / unexpected input scenarios
+      - negative_scenarios:      invalid inputs, unauthorised access, missing data
+      - validation_rules:        field rules, format rules, state constraints
+      - api_interactions:        any API/integration touch points mentioned
+      - qa_gaps:                 missing information that should have been in the ticket
+                                 (e.g. 'Error message text not defined',
+                                       'Permission rules for contributor role unclear')
+    """
+    ticket = json.loads(ticket_json)
+    reqs   = ticket["requirements"]
+    source_label = {
+        "ac":          "Acceptance Criteria",
+        "str":         "Steps to Reproduce",
+        "description": "Description (no AC provided)",
+        "none":        "Summary only (no structured requirements)",
+    }[ticket["primary_source"]]
+
+    req_block = "\n".join(f"{i+1}. {r}" for i, r in enumerate(reqs)) or "Not provided."
+    str_block = "\n".join(f"{i+1}. {s}" for i, s in enumerate(ticket["steps_to_reproduce"], 1)) or "Not provided."
+    # Strip base64 blobs (inline images pasted into Jira descriptions) before sending to LLM.
+    # They consume tokens silently without adding any testable information.
+    _raw_desc  = ticket["description_notes"] or ""
+    _raw_desc  = re.sub(r'[A-Za-z0-9+/]{100,}={0,2}', '[image-removed]', _raw_desc)
+    desc_block = _raw_desc[:3000] or "Not provided."
+    comments_block = ticket["comments"] or "Not provided."
+
+    existing_snippet = existing_tcs_json[:1200] if existing_tcs_json else "None"
+    cypress_snippet  = cypress_context[:800]    if cypress_context     else "None"
+    role_section     = (
+        f"\nRole Permission Context (use when identifying permission-related edge cases and QA gaps):\n{role_context}\n"
+        if role_context.strip() else ""
+    )
+
+    prompt = f"""You are a senior QA architect analysing a Jira ticket before test case generation.
+
+Ticket: {ticket['ticket_key']} ({ticket['ticket_type']}) — {ticket['summary']}
+
+Primary requirements source: {source_label}
+Requirements:
+{req_block}
+
+Steps to Reproduce:
+{str_block}
+
+Background / Dev Notes:
+{desc_block}
+
+Comments (BA/PO clarifications):
+{comments_block}
+{role_section}
+Existing TestRail cases (for gap awareness):
+{existing_snippet}
+
+Existing Cypress patterns (for automation awareness):
+{cypress_snippet}
+
+════════════════════════════════════════════
+TASK
+════════════════════════════════════════════
+Analyse the ticket above and extract a comprehensive test planning brief.
+
+Return ONLY valid JSON — no markdown fences, no explanation:
+{{
+  "functional_requirements": [
+    "Clear, unambiguous restatement of each requirement. One sentence per item."
+  ],
+  "edge_cases": [
+    "Boundary values, empty input states, max/min limits, special characters, concurrent actions.",
+    "IMPORTANT: For any search, filter, or list feature also include: zero-results / no-match state (valid query that returns no results), single-result state, and maximum-results state."
+  ],
+  "negative_scenarios": [
+    "Invalid inputs, unauthorised access, missing required fields, wrong data types.",
+    "IMPORTANT: For search/filter features also include: query that matches nothing (no results found), query that partially matches, query with only whitespace."
+  ],
+  "validation_rules": [
+    "Field-level rules, format constraints, state machine rules, dependent field logic."
+  ],
+  "api_interactions": [
+    "API endpoints, payloads, or integration points implied by the requirements. Empty list if none."
+  ],
+  "test_design_techniques": [
+    "Name the specific QA techniques applicable: Boundary Value Analysis, Equivalence Partitioning, State Transition, Decision Table, etc."
+  ],
+  "qa_gaps": [
+    "Missing information that a tester needs but the ticket does not provide.",
+    "Examples: 'Error message text not specified', 'Permission rules for contributor role unclear', 'Expected API response not defined'.",
+    "Return empty list if ticket is complete."
+  ]
+}}"""
+
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+        max_tokens=2000,
+    )
+    raw = resp.choices[0].message.content.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw).strip()
+    return json.loads(raw)
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def critique_test_cases(
+    cases_json: str,    # JSON string of generated test cases
+    requirements_json: str,  # JSON string of extracted requirements brief
+) -> dict:
+    """
+    Pipeline Step 3 — LLM self-critique pass.
+    Reviews generated test cases against the requirements brief and returns:
+      - case_scores: per-case confidence score + reason
+      - overall_score: 0.0–1.0
+      - missing_coverage: scenarios not covered by any generated case
+      - duplicate_pairs: pairs of cases covering the same scenario
+      - improvement_suggestions: concrete rewrites or additions
+    """
+    prompt = f"""You are a senior QA lead reviewing a set of generated test cases.
+
+Requirements Brief (what should be covered):
+{requirements_json}
+
+Generated Test Cases:
+{cases_json}
+
+════════════════════════════════════════════
+TASK
+════════════════════════════════════════════
+Review the generated test cases against the requirements brief.
+
+Return ONLY valid JSON — no markdown fences, no explanation:
+{{
+  "overall_score": 0.85,
+  "overall_reason": "One-sentence summary of coverage quality.",
+  "case_scores": [
+    {{
+      "tc_id": "TC-FEATURE-001",
+      "score": 0.90,
+      "reason": "Clear steps, correct expected result, maps to FR-1."
+    }}
+  ],
+  "missing_coverage": [
+    "Scenario not covered by any generated test case."
+  ],
+  "duplicate_pairs": [
+    ["TC-FEATURE-003", "TC-FEATURE-007"]
+  ],
+  "improvement_suggestions": [
+    "Add a test case for empty filter value (edge case EC-2 not covered)."
+  ]
+}}"""
+
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+        max_tokens=2000,
+    )
+    raw = resp.choices[0].message.content.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw).strip()
+    return json.loads(raw)
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def generate_test_cases(
     story_key: str,
@@ -610,9 +923,12 @@ def generate_test_cases(
     selected_roles: tuple,
     feature_prefix: str,
 ) -> list:
-    # P1-fix: send only clean titles so GPT can identify duplicates reliably.
-    # Raw content (TestRail Case ID, Suite, Priority noise) wastes tokens and
-    # causes GPT to miss duplicate detection when only the title matches.
+    """
+    Pipeline Step 2 — generate test cases using the structured requirements brief
+    produced by extract_requirements() (Step 1) as the primary input.
+    Falls back gracefully if the brief is unavailable.
+    """
+    # ── Build clean existing-case titles block ────────────────────────────────
     existing_titles = []
     for tc in existing_tcs:
         try:
@@ -622,104 +938,134 @@ def generate_test_cases(
         title_match = re.search(r'Title:\s*(.+)', raw_content)
         if title_match:
             existing_titles.append(title_match.group(1).strip()[:120])
-    existing_block = (
-        "\n".join(f"- {t}" for t in existing_titles) or "None"
-    )
-    desc_block = description.strip() or "Not provided."
+    existing_block = "\n".join(f"- {t}" for t in existing_titles) or "None"
 
-    # P1-fix: when AC is empty, extract numbered/bulleted items from Description
-    # so the per-AC coverage rules still apply to description-only stories
-    effective_ac = list(ac_list)
-    if not effective_ac and description.strip():
-        for line in description.splitlines():
-            s = line.strip()
-            clean = re.sub(r'^[-*•]\s+|^\d+\.\s+', '', s).strip()
-            if clean and len(clean) > 15:   # skip very short noise lines
-                effective_ac.append(clean)
+    # ── Normalise ticket and run Step 1 (requirement extraction) ─────────────
+    ticket_type = "Bug" if any(
+        kw in summary.lower() for kw in ("bug", "fix", "defect", "regression", "broken", "error", "fail")
+    ) else "Story"
+    ticket = normalize_ticket(
+        story_key, summary, description, ac_list, str_list, comments, ticket_type
+    )
+    ticket_json = json.dumps(ticket, sort_keys=True)
 
-    ac_fallback = (
-        "No Acceptance Criteria found — infer test cases from the Description and Summary above."
-        if not effective_ac
-        else ""
-    )
-    ac_block = (
-        "\n".join(f"AC-{i:02d}: {a}" for i, a in enumerate(effective_ac, 1))
-        or ac_fallback
-    )
-    ac_count = len(effective_ac) or 1   # floor at 1 to avoid "AC-01 … AC-00" in prompt
-    str_block = (
-        "\n".join(f"{i}. {s}" for i, s in enumerate(str_list, 1))
-        or "Not provided."
-    )
+    existing_tcs_json = json.dumps(existing_titles[:20])  # cap for token budget
+    role_ctx  = get_role_context(summary, feature_prefix)
+    brief     = extract_requirements(ticket_json, cypress_context, existing_tcs_json, role_ctx)
+
+    # ── Build prompt blocks from the requirements brief ───────────────────────
+    fr_block   = "\n".join(f"FR-{i:02d}: {r}" for i, r in enumerate(brief.get("functional_requirements", ticket["requirements"]), 1))
+    ec_block   = "\n".join(f"EC-{i:02d}: {e}" for i, e in enumerate(brief.get("edge_cases", []), 1)) or "None identified."
+    neg_block  = "\n".join(f"NS-{i:02d}: {n}" for i, n in enumerate(brief.get("negative_scenarios", []), 1)) or "None identified."
+    val_block  = "\n".join(f"VR-{i:02d}: {v}" for i, v in enumerate(brief.get("validation_rules", []), 1)) or "None identified."
+    api_block  = "\n".join(f"- {a}" for a in brief.get("api_interactions", [])) or "None identified."
+    tech_block = ", ".join(brief.get("test_design_techniques", [])) or "Standard functional testing."
+    str_block  = "\n".join(f"{i}. {s}" for i, s in enumerate(str_list, 1)) or "Not provided."
+
+    fr_count = len(brief.get("functional_requirements", ticket["requirements"])) or 1
+
+    # Strip base64 blobs from description before injecting into Step 2 prompt
+    _desc_clean = re.sub(r'[A-Za-z0-9+/]{100,}={0,2}', '[image-removed]', description)
+    _desc_clean = _desc_clean.strip()[:3000] or "Not provided."
+
     roles_block = ", ".join(selected_roles) or "admin, editor, contributor, consumer"
-    comments_block = comments.strip() or None
     comments_section = (
-        f"\nComments (BA/PO clarifications — treat as supplementary requirements):\n{comments_block}\n"
-        if comments_block else ""
+        f"\nComments (BA/PO clarifications):\n{comments.strip()}\n"
+        if comments.strip() else ""
     )
     cypress_section = (
-        f"\nExisting Cypress Automation Patterns (use to inform automation_status and step phrasing):\n{cypress_context}\n"
+        f"\nExisting Cypress Automation Patterns (inform automation_status):\n{cypress_context[:600]}\n"
         if cypress_context.strip() else ""
     )
+    role_context_section = (
+        f"\nRole Permission Context (use to write precise preconditions, scope negative role cases,\n"
+        f"and decide whether a behaviour change per role is expected for this feature):\n{role_ctx}\n"
+        if role_ctx.strip() else ""
+    )
 
-    prompt = f"""You are a senior QA engineer following Kapost/Pilyr testing standards.
+    item_tag = "SC" if ticket["primary_source"] == "str" else "FR"
+    source_note = (
+        "Requirements were derived from Steps to Reproduce (no formal AC provided)."
+        if ticket["primary_source"] == "str"
+        else "Requirements sourced from Acceptance Criteria."
+        if ticket["primary_source"] == "ac"
+        else "Requirements inferred from Description (no AC or STR provided)."
+    )
+
+    prompt = f"""You are a senior QA engineer with 10+ years experience following Kapost testing standards.
 The platform is a B2B content marketing SaaS with 4 user roles: admin, editor, contributor, consumer.
 
-Jira Story: {story_key} — {summary}
+Jira {ticket_type}: {story_key} — {summary}
+{source_note}
 
-Description:
-{desc_block}
+════════════ REQUIREMENTS BRIEF ════════════
+Functional Requirements ({fr_count} items — ALL must be covered by at least one positive test case):
+{fr_block}
 
-Acceptance Criteria ({ac_count} items — each MUST be covered):
-{ac_block}
+Edge Cases (must be covered):
+{ec_block}
 
-Steps to Reproduce (use to inform negative/regression cases):
+Negative Scenarios (must be covered):
+{neg_block}
+
+Validation Rules (apply to relevant test cases):
+{val_block}
+
+API / Integration Touch Points:
+{api_block}
+
+Test Design Techniques to apply: {tech_block}
+
+Steps to Reproduce (use as test execution steps):
 {str_block}
 {comments_section}
-Existing TestRail Test Cases (do NOT duplicate these):
+Background / Dev Notes (context only — not requirements):
+{_desc_clean}
+{role_context_section}{cypress_section}
+Existing TestRail Test Cases (do NOT duplicate):
 {existing_block}
-{cypress_section}
+
 Roles to cover: {roles_block}
 Feature prefix for TC IDs: {feature_prefix}
 
 ══════════════════════════════════════════════════════
 COVERAGE MANDATE
 ══════════════════════════════════════════════════════
-There are {ac_count} AC items above (AC-01 … AC-{ac_count:02d}).
+There are {fr_count} functional requirements above ({item_tag}-01 … {item_tag}-{fr_count:02d}).
 
-STEP 1 — PER-AC CASES (do this first, in order):
-  Write one dedicated positive test case per AC item.
-  Tag each title: "[AC-XX] <what is being verified>"
-  Example: "[AC-05] Search box displays cross icon only when text is entered"
+STEP 1 — PER-{item_tag} CASES (one positive test case per functional requirement, in order):
+  Tag each title: "[{item_tag}-XX] <what is being verified>"
+  Only group items that are literally sequential sub-steps of one indivisible flow.
+  When in doubt — do NOT group.
 
-  ONLY group multiple AC items into one test case when they are literally
-  sub-steps of the exact same indivisible user action
-  (e.g. "1. Click Save → 2. Spinner shows → 3. Toast appears" = one flow).
-  Even then, every AC number in the group must appear in the title tag.
-  When in doubt — do NOT group. Give each item its own test case.
+STEP 2 — EDGE & BOUNDARY CASES:
+  Cover all Edge Cases (EC-01…) using Boundary Value Analysis and Equivalence Partitioning.
+  For any search, filter, or list feature ALWAYS include:
+    - A case where the query/filter returns ZERO results (no-match / empty results state)
+    - A case where the query returns exactly one result
+  Tag: "[EC-XX] <boundary or edge being tested>"
 
-STEP 2 — NEGATIVE CASES:
-  For every AC item that involves a UI control, an input field, a conditional
-  display rule, or a state change — write one negative/boundary test case.
-  Tag: "[AC-XX – Negative] <what fails or is invalid>"
+STEP 3 — NEGATIVE CASES:
+  Cover all Negative Scenarios (NS-01…) and Validation Rules.
+  For search/filter features ALWAYS include a case for a valid query that matches nothing.
+  Tag: "[{item_tag}-XX – Negative] <what fails or is invalid>"
 
-STEP 3 — SUPPLEMENTARY (add after all per-AC cases):
-  - 1–3 role permission cases: contributor and consumer trying to use the feature
-  - 1–2 edge cases: empty state, dependency deletion, concurrent edit, reload
-  - 1 error-handling case: network failure or server 500
+STEP 4 — SUPPLEMENTARY:
+  - At least one role-permission case each for contributor and consumer
+  - 1 error-handling / API failure case if API touch points exist
+  - 1 concurrent edit or reload edge case if relevant
 
-Expected output range: {ac_count} to {ac_count * 2} test cases.
-If you are producing fewer than {ac_count} cases you are grouping too aggressively — stop and revise.
-Do NOT stop generating until every AC-01 through AC-{ac_count:02d} is covered.
+Expected output: {fr_count} to {fr_count * 2} test cases minimum.
+Do NOT stop until every {item_tag}-01 through {item_tag}-{fr_count:02d} AND every EC and NS is covered.
 ══════════════════════════════════════════════════════
 
 Return ONLY a valid JSON array — no markdown fences, no explanation:
 [
   {{
     "tc_id":             "{feature_prefix}-001",
-    "title":             "[AC-XX] [Action] [Object] verifies [Expected Outcome]",
+    "title":             "[{item_tag}-XX] [Action] [Object] verifies [Expected Outcome]",
     "priority":          "Critical|High|Medium|Low",
-    "type":              "Functional|Regression|Smoke|Integration|Negative",
+    "type":              "Functional|Regression|Smoke|Integration|Negative|Edge",
     "preconditions":     "Role required, existing data state, feature flags if any",
     "steps":             "1. First step\\n2. Second step\\n3. Third step",
     "expected_result":   "Observable, verifiable outcome after all steps",
@@ -731,17 +1077,11 @@ Return ONLY a valid JSON array — no markdown fences, no explanation:
 
 Rules:
 - Sequential IDs: {feature_prefix}-001, {feature_prefix}-002, etc.
-- Priority: Critical = core/data-loss, High = main flows, Medium = edge cases, Low = cosmetic
-- automation_status: "Candidate" for stable repeatable flows, "Manual" for exploratory,
-  "Automated" if it clearly maps to an existing Cypress pattern
+- Priority: Critical = core/data-loss, High = main flows, Medium = edge/negative cases, Low = cosmetic
+- automation_status: Candidate = stable repeatable, Manual = exploratory, Automated = maps to Cypress
 - Always prefix test data with "CY_Test |"
-- ROLE SCOPING RULE:
-  ALWAYS include at least one negative case for contributor and one for consumer
-  (cannot perform write/admin actions). Generate full role-specific flows ONLY when
-  the story explicitly names a role or behaviour clearly differs by role.
-  Do NOT duplicate the full happy-path per role — role cases must focus on
-  access-control boundaries (403 / permission denied / feature hidden).
-  When in doubt, use admin for positive flows."""
+- Role cases: at least one negative for contributor, one for consumer. Full role flows only when
+  the story explicitly names a role. Focus on access-control boundaries, not duplicating happy-path."""
 
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
@@ -753,7 +1093,7 @@ Rules:
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw).strip()
 
-    # P1-fix: recover from truncated JSON — trim to last complete object
+    # Recover from truncated JSON — trim to last complete object
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
@@ -810,7 +1150,7 @@ def generate_bulk_test_cases(
     stories_block = "\n\n".join(story_sections)
 
     prompt = (
-        "You are a senior QA engineer following Kapost/Pilyr testing standards.\n"
+        "You are a senior QA engineer following Kapost testing standards.\n"
         "The platform is a B2B content marketing SaaS with 4 user roles: admin, editor, contributor, consumer.\n\n"
         f"You are generating a UNIFIED test suite for a FEATURE spanning {len(stories)} Jira stories/bugs.\n"
         f"Stories in this feature: {all_keys}\n\n"
@@ -983,6 +1323,11 @@ def export_to_testrail(cases: list, suite_id: int, section_id: int) -> list:
         raw_steps = case.get("steps", "")
         overall_expected = case.get("expected_result", "")
 
+        # Normalise step separators: GPT often encodes newlines as literal \n in
+        # the JSON string value. json.loads() keeps them as the two-char sequence
+        # "\n" rather than a real newline, so splitlines() sees one long line.
+        raw_steps = raw_steps.replace("\\n", "\n")
+
         # P3-fix: parse "Step N: … \n  Expected: …" pairs and assign per-step
         # expected results instead of dumping everything on the last step.
         step_objs = []
@@ -1019,16 +1364,21 @@ def export_to_testrail(cases: list, suite_id: int, section_id: int) -> list:
                 if clean:
                     step_objs.append({"content": clean, "expected": ""})
 
-        # Assign overall expected result to the last step if it has none
-        if step_objs and overall_expected and not step_objs[-1]["expected"]:
-            step_objs[-1]["expected"] = overall_expected
+        # Build plain-text steps string for sections using the "Test Case (Text)" template.
+        # TestRail silently ignores custom_steps_separated when the section template is
+        # "Test Case (Text)" — sending custom_steps as well ensures steps are always saved.
+        plain_steps = "\n".join(
+            f"{i}. {obj['content']}" + (f"\n   Expected: {obj['expected']}" if obj.get("expected") else "")
+            for i, obj in enumerate(step_objs, 1)
+        )
 
         payload = {
             "title":                  case["title"],
-            "type_id":                1,
-            "priority_id":            TESTRAIL_PRIORITY.get(case.get("priority", "Medium"), 3),
+            "type_id":                2,
+            "priority_id":            TESTRAIL_PRIORITY.get(case.get("priority", "Medium"), 2),
             "custom_preconds":        case.get("preconditions", ""),
-            "custom_steps_separated": step_objs,
+            "custom_steps_separated": step_objs,   # for "Test Case (Steps)" template
+            "custom_steps":           plain_steps,  # for "Test Case (Text)" template
             "custom_expected":        overall_expected,
             "refs":                   case.get("jira_ref", case.get("tc_id", "")),
             "suite_id":               suite_id,
@@ -1429,6 +1779,71 @@ with tab1:
                     st.markdown(_comments_text[:1500])
             else:
                 st.caption("ℹ️ No comments found for this story.")
+
+        # ── QA Intelligence: run Step 1 and surface ticket gaps ──────────────
+        st.divider()
+        with st.spinner("🔬 Analysing ticket quality…"):
+            try:
+                _ticket_type = "Bug" if any(
+                    kw in selected["summary"].lower()
+                    for kw in ("bug", "fix", "defect", "regression", "broken", "error", "fail")
+                ) else "Story"
+                _ticket = normalize_ticket(
+                    selected["key"], selected["summary"], desc,
+                    tuple(ac_list), tuple(str_list), "", _ticket_type,
+                )
+                _ticket_json = json.dumps(_ticket, sort_keys=True)
+                _role_ctx    = get_role_context(selected["summary"], feature_prefix)
+                _brief       = extract_requirements(_ticket_json, "", "", _role_ctx)
+                st.session_state[f"brief_{selected['key']}"] = _brief
+
+                _qa_gaps = _brief.get("qa_gaps", [])
+                if _qa_gaps:
+                    with st.expander(
+                        f"⚠️ QA Intelligence — {len(_qa_gaps)} ticket gap(s) detected",
+                        expanded=True,
+                    ):
+                        st.caption(
+                            "These are missing details a tester needs but the ticket doesn't provide. "
+                            "Consider clarifying with the author before generating test cases."
+                        )
+                        for gap in _qa_gaps:
+                            st.markdown(f"⚠️ {gap}")
+                else:
+                    st.success("✅ QA Intelligence — ticket looks complete, no obvious gaps detected.")
+
+                _fr_count = len(_brief.get("functional_requirements", _ticket["requirements"]))
+                _ec_count = len(_brief.get("edge_cases", []))
+                _ns_count = len(_brief.get("negative_scenarios", []))
+                _techs    = ", ".join(_brief.get("test_design_techniques", [])) or "—"
+                with st.expander("📊 Requirements Brief (used for generation)", expanded=False):
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Functional Requirements", _fr_count)
+                    c2.metric("Edge Cases identified", _ec_count)
+                    c3.metric("Negative Scenarios", _ns_count)
+                    st.caption(f"**Test design techniques:** {_techs}")
+                    if _brief.get("functional_requirements"):
+                        st.markdown("**Functional Requirements:**")
+                        for i, fr in enumerate(_brief["functional_requirements"], 1):
+                            st.markdown(f"{i}. {fr}")
+                    if _brief.get("edge_cases"):
+                        st.markdown("**Edge Cases:**")
+                        for i, ec in enumerate(_brief["edge_cases"], 1):
+                            st.markdown(f"{i}. {ec}")
+                    if _brief.get("negative_scenarios"):
+                        st.markdown("**Negative Scenarios:**")
+                        for i, ns in enumerate(_brief["negative_scenarios"], 1):
+                            st.markdown(f"{i}. {ns}")
+                    if _brief.get("validation_rules"):
+                        st.markdown("**Validation Rules:**")
+                        for i, vr in enumerate(_brief["validation_rules"], 1):
+                            st.markdown(f"{i}. {vr}")
+                    if _brief.get("api_interactions") and any(_brief["api_interactions"]):
+                        st.markdown("**API / Integration Touch Points:**")
+                        for api in _brief["api_interactions"]:
+                            st.markdown(f"- {api}")
+            except Exception as _e:
+                st.caption(f"ℹ️ QA Intelligence analysis unavailable: {_e}")
     else:
         st.warning("Could not retrieve story content from Jira API or RAG.")
 
@@ -1498,7 +1913,7 @@ with tab3:
         comments  = _live_cmt or (extract_comments(content) if include_comments else "")
         ex_tcs      = get_existing_test_cases(selected["key"], selected["summary"])
         cypress_ctx = get_cypress_patterns(selected["summary"])
-        with st.spinner(f"Generating structured test cases with {OPENAI_MODEL}…"):
+        with st.spinner(f"Step 2/3: Generating test cases with {OPENAI_MODEL}…"):
             try:
                 cases = generate_test_cases(
                     selected["key"], selected["summary"],
@@ -1537,12 +1952,70 @@ with tab3:
                         "Review them below before exporting.",
                         icon="⚠️",
                     )
+
+                # ── Step 3: Self-critique pass ────────────────────────────
+                with st.spinner("🔍 Running self-critique and scoring confidence…"):
+                    try:
+                        _brief_for_critique = st.session_state.get(f"brief_{selected['key']}", {})
+                        _critique = critique_test_cases(
+                            json.dumps(cases, sort_keys=True),
+                            json.dumps(_brief_for_critique, sort_keys=True),
+                        )
+                        st.session_state[f"critique_{selected['key']}"] = _critique
+                        # Attach per-case scores back onto the case dicts
+                        _score_map = {
+                            s["tc_id"]: s
+                            for s in _critique.get("case_scores", [])
+                            if "tc_id" in s
+                        }
+                        for case in cases:
+                            tc_id = case.get("tc_id", "")
+                            if tc_id in _score_map:
+                                case["_score"]        = _score_map[tc_id].get("score", None)
+                                case["_score_reason"] = _score_map[tc_id].get("reason", "")
+                        st.session_state[state_cases] = cases
+                    except Exception:
+                        pass  # critique is optional — don't block generation
             except Exception as e:
                 st.error(f"Generation failed: {e}")
 
     generated = st.session_state[state_cases]
 
     if generated:
+        # ── Critique / coverage summary banner ───────────────────────────────
+        _critique = st.session_state.get(f"critique_{selected['key']}")
+        if _critique:
+            _overall  = _critique.get("overall_score", 0)
+            _reason   = _critique.get("overall_reason", "")
+            _missing  = _critique.get("missing_coverage", [])
+            _dups     = _critique.get("duplicate_pairs", [])
+            _suggests = _critique.get("improvement_suggestions", [])
+            _score_pct = int(_overall * 100)
+            _score_emoji = "🟢" if _overall >= 0.80 else "🟡" if _overall >= 0.60 else "🔴"
+            st.info(
+                f"{_score_emoji} **Coverage Score: {_score_pct}/100** — {_reason}",
+                icon="📊",
+            )
+            if _missing or _dups or _suggests:
+                with st.expander(
+                    f"🔍 Self-Critique — "
+                    f"{len(_missing)} gap(s), {len(_dups)} duplicate pair(s), "
+                    f"{len(_suggests)} suggestion(s)",
+                    expanded=(_overall < 0.80),
+                ):
+                    if _missing:
+                        st.markdown("**Missing Coverage:**")
+                        for m in _missing:
+                            st.markdown(f"⚠️ {m}")
+                    if _dups:
+                        st.markdown("**Potential Duplicate Pairs:**")
+                        for pair in _dups:
+                            st.markdown(f"🔁 {' ↔ '.join(pair)}")
+                    if _suggests:
+                        st.markdown("**Improvement Suggestions:**")
+                        for s in _suggests:
+                            st.markdown(f"💡 {s}")
+
         st.subheader(f"Generated {len(generated)} Test Case(s)")
         st.caption("Select cases to review and export to TestRail:")
 
@@ -1552,12 +2025,17 @@ with tab3:
             typ  = tc.get("type", "Functional")
             auto = tc.get("automation_status", "Manual")
 
+            _score = tc.get("_score")
+            _score_badge = (
+                f"  |  {'🟢' if _score >= 0.8 else '🟡' if _score >= 0.6 else '🔴'} {int(_score*100)}"
+                if _score is not None else ""
+            )
             _dup_tag = " ⚠️ NEAR-DUPLICATE" if tc.get("_duplicate_of") else ""
             checked = st.checkbox(
                 f"**[{tc.get('tc_id', f'{feature_prefix}-{i+1:03d}')}]** "
                 f"{PRIORITY_MAP.get(pri, '')} {pri}  |  "
                 f"{TYPE_MAP.get(typ, '')} {typ}  |  "
-                f"🤖 {auto}  —  {tc['title']}{_dup_tag}",
+                f"🤖 {auto}{_score_badge}  —  {tc['title']}{_dup_tag}",
                 value=(i in st.session_state[state_sel]),
                 key=f"chk_{selected['key']}_{i}",
             )
@@ -1565,6 +2043,8 @@ with tab3:
                 selected_indices.append(i)
 
             with st.expander("✏️ Edit Details", expanded=False):
+                if _score is not None:
+                        st.caption(f"**Confidence:** {'🟢' if _score >= 0.8 else '🟡' if _score >= 0.6 else '🔴'} {int(_score*100)}/100 — {tc.get('_score_reason', '')}")
                 _pfx = f"edit_{selected['key']}_{i}"
                 st.text_input("Title", value=tc.get("title", ""), key=f"{_pfx}_title")
                 _c1, _c2, _c3 = st.columns(3)

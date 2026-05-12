@@ -1,5 +1,5 @@
 """
-Jira ingestion for Kapost/Pilyr.
+Jira ingestion for Kapost.
 Fetches stories, bugs, epics from your Jira project and returns them
 as structured dicts ready for the FAISS vectorstore.
 
