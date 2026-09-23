@@ -11,6 +11,7 @@ import os
 import sys
 import json
 import re
+import asyncio
 import requests
 from collections import Counter
 import sys as _sys
@@ -21,6 +22,7 @@ if _sys.platform == "win32":  # Windows corporate SSL certs only
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
+from test_rail_mcp.testrail_duplicate_checker import NewTestCase, TestRailDuplicateChecker
 
 # ── Path / env setup ─────────────────────────────────────────────────────────
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1896,9 +1898,16 @@ with tab3:
         st.session_state[state_cases] = []
         st.session_state[state_sel]   = []
 
-    col_gen, col_clr = st.columns([3, 1])
+    col_gen, col_mcp, col_clr = st.columns([3, 3, 1])
     with col_gen:
         gen_clicked = st.button("🤖 Generate Test Cases", type="primary", use_container_width=True)
+
+    with col_mcp:
+        check_duplicated_cases_clicked = st.button(
+            "🔍 Check Duplicated Cases with Test Rail MCP",
+             type="primary",
+            use_container_width=True
+        )
     with col_clr:
         if st.button("🗑️ Clear", use_container_width=True):
             st.session_state[state_cases] = []
@@ -1980,6 +1989,34 @@ with tab3:
                 st.error(f"Generation failed: {e}")
 
     generated = st.session_state[state_cases]
+
+    if check_duplicated_cases_clicked:
+        if(len(generated) > 0):
+            st.info("Checking for duplicated cases with Test Rail MCP...")
+            print("Checking for duplicated cases with Test Rail MCP...")
+            tr_dupl_checker = TestRailDuplicateChecker()
+            new_cases = [
+                NewTestCase(
+                    title=case.get("title", ""),
+                    preconditions=case.get("preconditions", ""),
+                    steps=case.get("steps", ""),
+                    expected_result=case.get("expected_result", ""),
+                )
+                for case in generated
+            ]
+            duplicated_cases = asyncio.run(
+                tr_dupl_checker.find_duplicates(
+                    project_id=TESTRAIL_PROJECT_ID,
+                    new_cases=new_cases,
+                )
+            )
+            if duplicated_cases:
+                st.warning(
+                    f"Found {len(duplicated_cases)} potential duplicated case(s) in Test Rail MCP.",
+                    icon="⚠️",
+                )
+            else:
+                st.success("No duplicated cases found in Test Rail MCP.", icon="✅")
 
     if generated:
         # ── Critique / coverage summary banner ───────────────────────────────

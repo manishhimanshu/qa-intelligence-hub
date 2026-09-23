@@ -30,3 +30,6 @@ Thumbs.db
 .vscode/
 .idea/
 .codegpt/
+
+# Test Rail MCP
+custom-agent-ui/test_rail_mcp/node_modules/

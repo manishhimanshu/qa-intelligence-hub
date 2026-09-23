@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "@uarlouski/testrail-mcp-server": "^3.0.0"
+  }
+}
