@@ -38,7 +38,8 @@ Example:
 from __future__ import annotations
 
 import asyncio
-
+import base64
+import aiohttp
 import json
 import os
 from dataclasses import dataclass
@@ -103,14 +104,11 @@ class TestRailDuplicateChecker:
             embedding_model_name: sentence-transformers model to use when
                 embed_fn is not provided.
         """
-        self.server_command = "node"
-        self.server_args = [_WRAPPER_PATH]
-        self.server_env = os.environ.copy()
-        self.server_env.update({
-            "TESTRAIL_INSTANCE_URL": os.getenv("TESTRAIL_URL", ""),
-            "TESTRAIL_USERNAME": os.getenv("TESTRAIL_USER", ""),
-            "TESTRAIL_API_KEY": os.getenv("TESTRAIL_TOKEN", ""),
-        })
+
+        self.base_url = os.getenv("TESTRAIL_URL", "")
+        self.username = os.getenv("TESTRAIL_USER", "")
+        self.api_token = os.getenv("TESTRAIL_TOKEN", "")
+        self.project_id = os.getenv("TESTRAIL_PROJECT_ID", "")
         self.similarity_threshold = similarity_threshold
         self._embed_fn = None
         self._embedding_model_name = "all-MiniLM-L6-v2"
@@ -132,77 +130,50 @@ class TestRailDuplicateChecker:
 
         return _embed
 
-    
+    async def _send_get(self, endpoint: str) -> dict:
+        auth = aiohttp.BasicAuth(self.username, self.api_token)
+        async with aiohttp.ClientSession(auth=auth) as session:
+            response = await session.get(f"{self.base_url}/index.php?/api/v2/{endpoint}")
+            response.raise_for_status()
+            if response.status != 200:
+                raise RuntimeError(f"GET {endpoint} failed with status {response.status}")
+            return await response.json()
 
-    async def _run_cli(self, command: str, arguments: dict) -> Any:
-        args = [self.server_command, *self.server_args, command]
-        for key, value in arguments.items():
-            if value is None:
-                continue
-            args.append(f"--{key}")
-            if isinstance(value, (dict, list)):
-                args.append(json.dumps(value))
-            else:
-                args.append(str(value).lower() if isinstance(value, bool) else str(value))
+    async def _get_suites(self) -> list[dict]:
+        suite_results = await self._send_get(f"get_suites/{self.project_id}")
+        return suite_results.get("suites", [])
 
-        process = await asyncio.create_subprocess_exec(
-            *args,
-            env=self.server_env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await process.communicate()
-        output = stdout.decode("utf-8", errors="replace").strip()
-        error = stderr.decode("utf-8", errors="replace").strip()
-        if process.returncode != 0:
-            detail = error or output or f"exit code {process.returncode}"
-            raise RuntimeError(f"TestRail CLI command {command!r} failed: {detail}")
+    async def _get_cases(self, suite_id: int) -> list[dict]:
+        case_results = await self._send_get(f"get_cases/{self.project_id}&suite_id={suite_id}")
+        return case_results.get("cases", [])
+          
 
-        try:
-            return json.loads(output)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                f"TestRail CLI command {command!r} returned invalid JSON: {output[:500]}"
-            ) from exc
-    
 
-    @staticmethod
-    def _extract_list(payload: Any, key: str) -> list[dict]:
-        """MCP tool results may return a bare list or a dictionary."""
-        if isinstance(payload, list):
-            return payload
-        if isinstance(payload, dict):
-            return payload.get(key, [])
-        return []
-
-    async def _fetch_all_project_cases(self, project_id: int) -> list[dict]:
+    async def _fetch_all_project_cases(self) -> list[dict]:
         """Fetches every test case in a project, handling multi-suite projects."""
        
-            # Multi-suite project (suite_mode=3): must enumerate suites first.
-        suites_result = await self._run_cli(
-            "query_suite",
-            {"payload": {"action": "many", "project_id": project_id}},
-        )
-        suites = self._extract_list(suites_result, "suites")
+        suites = await self._get_suites()
         cases: list[dict] = []
         for suite in suites:
-            suite_cases_result = await self._run_cli(
-                "get_cases", {"project_id": project_id, "suite_id": suite["id"],
-                                "fields":["custom_preconds","custom_steps_separated"]}
-            )
-            suite_cases = self._extract_list(suite_cases_result, "cases")
-            if str(suite["id"]) == "10631":
-                print(f"DEBUG: Cases for suite {suite['id']}:", json.dumps(suite_cases, indent=2))
+            suite_cases = await self._get_cases(suite["id"])
             cases.extend(suite_cases)
+        print(f"DEBUG: Total cases fetched for project {self.project_id}: {len(cases)}")
         return cases
 
     @staticmethod
     def _case_to_text(case: dict) -> str:
+        """Converts a test case dictionary into a plain text representation."""
+        # steps = case.get("custom_steps_separated", "") or ""
+        # steps_text = ""
+        # expected_result_text = ""
+        # if steps:
+        #     steps_text = "\n".join(f"{i+1}. {s.get('content', '')}" for i, s in enumerate(steps))
+        #     expected_result_text = "\n".join(f"{i+1}. {s.get('expected', '')}" for i, s in enumerate(steps))
+        # else:
+        #     steps_text = ""
         fields = (
-            case.get("title", ""),
-            case.get("custom_preconds", "") or "",
-            case.get("custom_steps", "") or "",
-            case.get("custom_expected", "") or "",
+            str(case.get("id","")),
+            case.get("title", "")
         )
         return "\n".join(f for f in fields if f)
 
@@ -219,7 +190,7 @@ class TestRailDuplicateChecker:
         """
         new_cases = list(new_cases)
         print("Running find_duplicates for project_id:", project_id)
-        existing_cases = await self._fetch_all_project_cases(project_id)
+        existing_cases = await self._fetch_all_project_cases()
 
         if not existing_cases:
             return {c.title: [] for c in new_cases}
