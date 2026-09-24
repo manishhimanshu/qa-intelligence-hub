@@ -2,13 +2,10 @@
 TestRail duplicate test-case checker.
 
 Runs the TestRail CLI through the local Node wrapper -- no LLM/agent required
-at runtime -- fetches every existing test case in a given TestRail project
-(handling both single-suite and multi-suite projects), and compares a list of
+at runtime -- fetches every existing test case in a given TestRail project and compares a list of
 proposed new test cases against them using semantic text embeddings + cosine
 similarity.
 
-Install dependencies:
-    pip install mcp sentence-transformers numpy
 
 Requires Node available on PATH and the local npm dependencies installed.
 
@@ -41,9 +38,9 @@ Example:
 from __future__ import annotations
 
 import asyncio
+
 import json
 import os
-import subprocess
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
 
@@ -92,11 +89,7 @@ class TestRailDuplicateChecker:
 
     def __init__(
         self,
-        server_command: str = "node",
-        server_args: Optional[list[str]] = None,
-        embed_fn: Optional[Callable[[list[str]], np.ndarray]] = None,
         similarity_threshold: float = 70.0,
-        embedding_model_name: str = "all-MiniLM-L6-v2",
     ):
         """
         Args:
@@ -110,8 +103,8 @@ class TestRailDuplicateChecker:
             embedding_model_name: sentence-transformers model to use when
                 embed_fn is not provided.
         """
-        self.server_command = server_command
-        self.server_args = server_args or [_WRAPPER_PATH]
+        self.server_command = "node"
+        self.server_args = [_WRAPPER_PATH]
         self.server_env = os.environ.copy()
         self.server_env.update({
             "TESTRAIL_INSTANCE_URL": os.getenv("TESTRAIL_URL", ""),
@@ -119,8 +112,8 @@ class TestRailDuplicateChecker:
             "TESTRAIL_API_KEY": os.getenv("TESTRAIL_TOKEN", ""),
         })
         self.similarity_threshold = similarity_threshold
-        self._embed_fn = embed_fn
-        self._embedding_model_name = embedding_model_name
+        self._embed_fn = None
+        self._embedding_model_name = "all-MiniLM-L6-v2"
 
     @property
     def embed_fn(self) -> Callable[[list[str]], np.ndarray]:
@@ -138,6 +131,8 @@ class TestRailDuplicateChecker:
             return model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
 
         return _embed
+
+    
 
     async def _run_cli(self, command: str, arguments: dict) -> Any:
         args = [self.server_command, *self.server_args, command]
@@ -169,10 +164,11 @@ class TestRailDuplicateChecker:
             raise RuntimeError(
                 f"TestRail CLI command {command!r} returned invalid JSON: {output[:500]}"
             ) from exc
+    
 
     @staticmethod
     def _extract_list(payload: Any, key: str) -> list[dict]:
-        """MCP tool results may return a bare list or a {key: [...]} envelope."""
+        """MCP tool results may return a bare list or a dictionary."""
         if isinstance(payload, list):
             return payload
         if isinstance(payload, dict):
@@ -181,24 +177,24 @@ class TestRailDuplicateChecker:
 
     async def _fetch_all_project_cases(self, project_id: int) -> list[dict]:
         """Fetches every test case in a project, handling multi-suite projects."""
-        try:
-            result = await self._run_cli("get_cases", {"project_id": project_id})
-            return self._extract_list(result, "cases")
-        except Exception:
+       
             # Multi-suite project (suite_mode=3): must enumerate suites first.
-            suites_result = await self._run_cli(
-                "query_suite",
-                {"payload": {"action": "many", "project_id": project_id}},
+        suites_result = await self._run_cli(
+            "query_suite",
+            {"payload": {"action": "many", "project_id": project_id}},
+        )
+        suites = self._extract_list(suites_result, "suites")
+        cases: list[dict] = []
+        for suite in suites:
+            suite_cases_result = await self._run_cli(
+                "get_cases", {"project_id": project_id, "suite_id": suite["id"],
+                                "fields":["custom_preconds","custom_steps_separated"]}
             )
-            suites = self._extract_list(suites_result, "suites")
-
-            cases: list[dict] = []
-            for suite in suites:
-                suite_cases_result = await self._run_cli(
-                    "get_cases", {"project_id": project_id, "suite_id": suite["id"]}
-                )
-                cases.extend(self._extract_list(suite_cases_result, "cases"))
-            return cases
+            suite_cases = self._extract_list(suite_cases_result, "cases")
+            if str(suite["id"]) == "10631":
+                print(f"DEBUG: Cases for suite {suite['id']}:", json.dumps(suite_cases, indent=2))
+            cases.extend(suite_cases)
+        return cases
 
     @staticmethod
     def _case_to_text(case: dict) -> str:
@@ -228,6 +224,8 @@ class TestRailDuplicateChecker:
         if not existing_cases:
             return {c.title: [] for c in new_cases}
 
+        #Here we need to normalize the content of TR cases because they may have inconsistent formatting.
+        #We want to be able to handle both custom_steps as well as test_steps
         existing_texts = [self._case_to_text(c) for c in existing_cases]
         existing_embeddings = self.embed_fn(existing_texts)
 

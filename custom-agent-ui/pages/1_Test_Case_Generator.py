@@ -1893,10 +1893,16 @@ with tab2:
 with tab3:
     state_cases = f"gen_cases_{selected['key']}"
     state_sel   = f"sel_idx_{selected['key']}"
+    state_dupes  = f"dupes_{selected['key']}"
+    state_dupes_v = f"dupes_v_{selected['key']}"
 
     if state_cases not in st.session_state:
         st.session_state[state_cases] = []
         st.session_state[state_sel]   = []
+    if state_dupes not in st.session_state:
+        st.session_state[state_dupes] = {}
+    if state_dupes_v not in st.session_state:
+        st.session_state[state_dupes_v] = 0
 
     col_gen, col_mcp, col_clr = st.columns([3, 3, 1])
     with col_gen:
@@ -1912,6 +1918,8 @@ with tab3:
         if st.button("🗑️ Clear", use_container_width=True):
             st.session_state[state_cases] = []
             st.session_state[state_sel]   = []
+            st.session_state[state_dupes] = {}
+            st.session_state[state_dupes_v] += 1
 
     if gen_clicked:
         content  = get_story_content(selected["key"], selected.get("content", ""))
@@ -1924,6 +1932,33 @@ with tab3:
         cypress_ctx = get_cypress_patterns(selected["summary"])
         with st.spinner(f"Step 2/3: Generating test cases with {OPENAI_MODEL}…"):
             try:
+                # TEMP: dummy cases to avoid burning OpenAI calls while iterating on the UI
+                # cases = [
+                #     {
+                #         "tc_id": f"{feature_prefix}-001",
+                #         "title": "[FR-01] Dummy case one verifies placeholder outcome",
+                #         "priority": "High",
+                #         "type": "Functional",
+                #         "preconditions": "N/A",
+                #         "steps": "1. Do thing one\n2. Do thing two",
+                #         "expected_result": "Placeholder expected result",
+                #         "test_data": "CY_Test | N/A",
+                #         "automation_status": "Manual",
+                #         "roles_covered": ["admin"],
+                #     },
+                #     {
+                #         "tc_id": f"{feature_prefix}-002",
+                #         "title": "[FR-02] Dummy case two verifies placeholder outcome",
+                #         "priority": "Medium",
+                #         "type": "Negative",
+                #         "preconditions": "N/A",
+                #         "steps": "1. Do thing three\n2. Do thing four",
+                #         "expected_result": "Placeholder expected result",
+                #         "test_data": "CY_Test | N/A",
+                #         "automation_status": "Candidate",
+                #         "roles_covered": ["contributor"],
+                #     },
+                # ]
                 cases = generate_test_cases(
                     selected["key"], selected["summary"],
                     desc,
@@ -1955,6 +1990,8 @@ with tab3:
 
                 st.session_state[state_cases] = cases
                 st.session_state[state_sel]   = [i for i in range(len(cases)) if i not in dup_indices]
+                st.session_state[state_dupes] = {}
+                st.session_state[state_dupes_v] += 1
                 if dup_indices:
                     st.warning(
                         f"⚠️ {len(dup_indices)} near-duplicate case(s) detected and pre-deselected. "
@@ -2010,9 +2047,12 @@ with tab3:
                     new_cases=new_cases,
                 )
             )
-            if duplicated_cases:
+            st.session_state[state_dupes] = duplicated_cases
+            st.session_state[state_dupes_v] += 1
+            _n_with_dupes = sum(1 for matches in duplicated_cases.values() if matches)
+            if _n_with_dupes:
                 st.warning(
-                    f"Found {len(duplicated_cases)} potential duplicated case(s) in Test Rail MCP.",
+                    f"Found potential duplicates for {_n_with_dupes} test case(s) in Test Rail MCP.",
                     icon="⚠️",
                 )
             else:
@@ -2097,6 +2137,24 @@ with tab3:
                     st.text_area("Preconditions", value=tc.get("preconditions", ""), key=f"{_pfx}_prec", height=80)
                 st.text_area("Steps", value=tc.get("steps", "").replace(chr(92)+"n", chr(10)), key=f"{_pfx}_steps", height=150)
                 st.text_area("Expected Result", value=tc.get("expected_result", ""), key=f"{_pfx}_expected", height=80)
+
+                _dupe_matches = st.session_state.get(state_dupes, {}).get(tc.get("title", ""), [])
+                st.markdown("**Potential Duplicates in Test Rail**")
+                with st.container(
+                    height=110, border=True,
+                    key=f"{_pfx}_dupes_v{st.session_state[state_dupes_v]}",
+                ):
+                    if _dupe_matches:
+                        for m in _dupe_matches:
+                            _link = f"https://upland.testrail.com/index.php?/cases/view/{m.existing_case_id}"
+                            st.markdown(
+                                f"{m.existing_case_title} — "
+                                f"Similarity score: {m.similarity}% - Test ID: "
+                                f"<a href='{_link}' target='_blank'>C{m.existing_case_id}</a>",
+                                unsafe_allow_html=True,
+                            )
+                    else:
+                        st.caption("No potential duplicates found")
 
         st.session_state[state_sel] = selected_indices
 
