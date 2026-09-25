@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from datetime import datetime
 import aiohttp
 import json
 import os
@@ -109,6 +110,7 @@ class TestRailDuplicateChecker:
         self.username = os.getenv("TESTRAIL_USER", "")
         self.api_token = os.getenv("TESTRAIL_TOKEN", "")
         self.project_id = os.getenv("TESTRAIL_PROJECT_ID", "")
+        self.excluded_suites = [int(n) for n in os.getenv("TESTRAIL_EXCLUDED_SUITES", "").split(",") if n.strip().isdigit()]
         self.similarity_threshold = similarity_threshold
         self._embed_fn = None
         self._embedding_model_name = "all-MiniLM-L6-v2"
@@ -144,8 +146,21 @@ class TestRailDuplicateChecker:
         return suite_results.get("suites", [])
 
     async def _get_cases(self, suite_id: int) -> list[dict]:
-        case_results = await self._send_get(f"get_cases/{self.project_id}&suite_id={suite_id}")
-        return case_results.get("cases", [])
+        """Fetches every test case for a suite, following TestRail's pagination
+        (the API caps responses at 250 cases per page)."""
+        cases: list[dict] = []
+        limit = 250
+        offset = 0
+        while True:
+            case_results = await self._send_get(
+                f"get_cases/{self.project_id}&suite_id={suite_id}&limit={limit}&offset={offset}"
+            )
+            page_cases = case_results.get("cases", [])
+            cases.extend(page_cases)
+            if len(page_cases) < limit:
+                break  # last page reached
+            offset += limit
+        return cases
           
 
 
@@ -155,6 +170,8 @@ class TestRailDuplicateChecker:
         suites = await self._get_suites()
         cases: list[dict] = []
         for suite in suites:
+            if suite["id"] in self.excluded_suites:
+                continue
             suite_cases = await self._get_cases(suite["id"])
             cases.extend(suite_cases)
         print(f"DEBUG: Total cases fetched for project {self.project_id}: {len(cases)}")
@@ -163,19 +180,26 @@ class TestRailDuplicateChecker:
     @staticmethod
     def _case_to_text(case: dict) -> str:
         """Converts a test case dictionary into a plain text representation."""
-        # steps = case.get("custom_steps_separated", "") or ""
-        # steps_text = ""
-        # expected_result_text = ""
-        # if steps:
-        #     steps_text = "\n".join(f"{i+1}. {s.get('content', '')}" for i, s in enumerate(steps))
-        #     expected_result_text = "\n".join(f"{i+1}. {s.get('expected', '')}" for i, s in enumerate(steps))
-        # else:
-        #     steps_text = ""
-        fields = (
-            str(case.get("id","")),
-            case.get("title", "")
-        )
-        return "\n".join(f for f in fields if f)
+        steps = case.get("custom_steps_separated", "") or ""
+        steps_text = ""
+        expected_result_text = ""
+        if steps:
+            steps_text = "\n".join(f"{i+1}. {s.get('content', '')}" for i, s in enumerate(steps))
+            expected_result_text = "\n".join(f"{i+1}. {s.get('expected', '')}" for i, s in enumerate(steps))
+        fields = [
+            case.get("title", ""),
+            case.get("custom_preconds", "") or "",
+            steps_text,
+            expected_result_text
+        ]
+        fields2 = [
+            case.get("title", ""),
+        ]
+        fields3 = [
+            case.get("title", ""),
+            steps_text,
+        ]
+        return "\n".join(f for f in fields2 if f)
 
     async def find_duplicates(
         self, project_id: int, new_cases: Iterable[NewTestCase]
@@ -190,8 +214,8 @@ class TestRailDuplicateChecker:
         """
         new_cases = list(new_cases)
         print("Running find_duplicates for project_id:", project_id)
+        start_time = datetime.now()
         existing_cases = await self._fetch_all_project_cases()
-
         if not existing_cases:
             return {c.title: [] for c in new_cases}
 
@@ -231,6 +255,7 @@ class TestRailDuplicateChecker:
                     f"    - Case {match.existing_case_id} "
                     f"({match.existing_case_title!r}) - similarity {match.similarity}%"
                 )
+        print(f"find_duplicates took {(datetime.now()- start_time).total_seconds():.2f} seconds")
         return results
 
 
