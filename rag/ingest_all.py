@@ -30,15 +30,21 @@ from ingest.testrail_ingest  import ingest_testrail_cases
 from ingest.pdf_ingest        import ingest_pdfs
 from ingest.md_ingest         import ingest_markdown_dir
 from ingest.cypress_ingest    import ingest_cypress_patterns
+from ingest.automation_ingest import ingest_automation_repo
 from vectorstore               import build_vectorstore
 
-def run_ingestion(sources: list[str] = None):
+def run_ingestion(sources: list[str] = None) -> bool:
     """
     Run all (or selected) ingestion sources and build/update the FAISS index.
-    Pass a subset list like ["jira", "testrail"] to refresh only those sources.
+    The no-argument run rebuilds the index from scratch. Pass a subset list like
+    ["jira", "testrail"] to add missing documents without replacing other sources.
     """
-    all_sources = sources or ["jira", "testrail", "pdf", "docs", "cypress"]
+    # Keep legacy cypress ingestion optional; automation ingestion is the
+    # default path for framework-grounded code generation.
+    rebuild = not sources
+    all_sources = sources or ["jira", "testrail", "pdf", "docs", "automation"]
     all_docs = []
+    failed_sources = []
 
     # ── 1. Jira ──────────────────────────────────────────────────────────────
     if "jira" in all_sources:
@@ -49,6 +55,7 @@ def run_ingestion(sources: list[str] = None):
             all_docs.extend(jira_docs)
         except Exception as e:
             print(f"      ✗ Jira ingestion failed: {e}")
+            failed_sources.append("jira")
 
     # ── 2. TestRail ──────────────────────────────────────────────────────────
     if "testrail" in all_sources:
@@ -59,10 +66,11 @@ def run_ingestion(sources: list[str] = None):
             all_docs.extend(tr_docs)
         except Exception as e:
             print(f"      ✗ TestRail ingestion failed: {e}")
+            failed_sources.append("testrail")
 
     # ── 3. PDFs ───────────────────────────────────────────────────────────────
     if "pdf" in all_sources:
-        pdf_dir = os.getenv("PDF_DIR", "./pdfs")
+        pdf_dir = os.getenv("PDF_DIR", "./docs/product_knowledge")
         print(f"\n[3/5] Ingesting PDFs from {pdf_dir}...")
         try:
             pdf_docs = ingest_pdfs(pdf_dir)
@@ -70,6 +78,7 @@ def run_ingestion(sources: list[str] = None):
             all_docs.extend(pdf_docs)
         except Exception as e:
             print(f"      ✗ PDF ingestion failed: {e}")
+            failed_sources.append("pdf")
 
     # ── 4. Markdown docs ──────────────────────────────────────────────────────
     if "docs" in all_sources:
@@ -81,30 +90,56 @@ def run_ingestion(sources: list[str] = None):
             all_docs.extend(md_docs)
         except Exception as e:
             print(f"      ✗ Markdown ingestion failed: {e}")
+            failed_sources.append("docs")
 
     # ── 5. Cypress patterns ───────────────────────────────────────────────────
     if "cypress" in all_sources:
-        cypress_root = os.getenv("CYPRESS_ROOT", "C:/Users/mhimanshu/Documents/ph")
-        print(f"\n[5/5] Ingesting Cypress patterns from {cypress_root}...")
+        cypress_root = (os.getenv("CYPRESS_ROOT") or "").strip()
+        if not cypress_root:
+            print("\n[5/6] Skipping legacy Cypress ingest: CYPRESS_ROOT is empty.")
+        else:
+            print(f"\n[5/6] Ingesting Cypress patterns from {cypress_root}...")
+            try:
+                cy_docs = ingest_cypress_patterns(cypress_root)
+                print(f"      ✓ {len(cy_docs)} Cypress knowledge chunks ingested.")
+                all_docs.extend(cy_docs)
+            except Exception as e:
+                print(f"      ✗ Cypress ingestion failed: {e}")
+                failed_sources.append("cypress")
+
+    # ── 6. Automation repository patterns ────────────────────────────────────
+    if "automation" in all_sources:
+        automation_root = os.getenv("AUTOMATION_REPO_ROOT", "C:/Users/mhimanshu/Documents/ph")
+        print(f"\n[6/6] Ingesting automation repository from {automation_root}...")
         try:
-            cy_docs = ingest_cypress_patterns(cypress_root)
-            print(f"      ✓ {len(cy_docs)} Cypress knowledge chunks ingested.")
-            all_docs.extend(cy_docs)
+            auto_docs = ingest_automation_repo(automation_root)
+            print(f"      ✓ {len(auto_docs)} automation knowledge chunks ingested.")
+            all_docs.extend(auto_docs)
         except Exception as e:
-            print(f"      ✗ Cypress ingestion failed: {e}")
+            print(f"      ✗ Automation ingestion failed: {e}")
+            failed_sources.append("automation")
 
     # ── Build / update vectorstore ────────────────────────────────────────────
+    if rebuild and failed_sources:
+        print(
+            "\nFresh rebuild aborted because these sources failed: "
+            f"{', '.join(failed_sources)}. The existing index was left unchanged."
+        )
+        return False
     if not all_docs:
         print("\n⚠  No documents ingested. Check your .env credentials and source directories.")
-        return
+        return False
 
-    print(f"\nBuilding FAISS index from {len(all_docs)} total documents...")
-    build_vectorstore(all_docs, persist=True)
+    operation = "fresh FAISS index" if rebuild else "FAISS index update"
+    print(f"\nBuilding {operation} from {len(all_docs)} total documents...")
+    build_vectorstore(all_docs, persist=True, rebuild=rebuild)
     print(f"✓ FAISS index saved to: {os.path.abspath(os.getenv('FAISS_INDEX_PATH', './faiss_index'))}")
     print("\nRAG knowledge base is ready. The MCP retriever will now use this index.")
+    return True
 
 
 if __name__ == "__main__":
     # Allow running specific sources: python ingest_all.py jira testrail
     sources = sys.argv[1:] if len(sys.argv) > 1 else None
-    run_ingestion(sources)
+    if not run_ingestion(sources):
+        raise SystemExit(1)

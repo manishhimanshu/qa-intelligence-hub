@@ -61,3 +61,80 @@ def get_relevant_docs(prompt: str, top_k: int = 5) -> list[dict]:
         entry.update(doc.metadata)
         results.append(entry)
     return results
+
+
+def get_relevant_docs_filtered(
+    prompt: str,
+    top_k: int = 5,
+    source_eq: str = "",
+    source_contains: str = "",
+    type_eq: str = "",
+    type_prefix: str = "",
+    feature_key_eq: str = "",
+    doc_domain_eq: str = "",
+    path_contains: str = "",
+    max_candidates: int = 60,
+) -> list[dict]:
+    """
+    Semantic retrieval with optional metadata filters.
+    Pulls a larger candidate set, then filters/ranks down to top_k.
+    """
+    if not os.path.exists(_FAISS_INDEX):
+        return [{"id": "no-index", "content": "RAG index not built yet. Run ingest_all.py first."}]
+
+    try:
+        _ui_dir = os.path.join(_RAG_DIR, "../custom-agent-ui")
+        if _ui_dir not in sys.path:
+            sys.path.insert(0, _ui_dir)
+        from shared_vectorstore import load_vectorstore
+        vs = load_vectorstore()
+    except Exception:
+        vs = _get_vectorstore()
+
+    if vs is None:
+        return [{"id": "no-index", "content": "RAG index not built yet. Run ingest_all.py first."}]
+
+    k = max(top_k * 5, 30)
+    k = min(k, max(1, int(max_candidates)))
+    docs = vs.similarity_search(prompt, k=k)
+
+    source_eq_l = (source_eq or "").strip().lower()
+    source_contains_l = (source_contains or "").strip().lower()
+    type_eq_l = (type_eq or "").strip().lower()
+    type_prefix_l = (type_prefix or "").strip().lower()
+    feature_key_eq_l = (feature_key_eq or "").strip().lower()
+    doc_domain_eq_l = (doc_domain_eq or "").strip().lower()
+    path_contains_l = (path_contains or "").strip().lower().replace("\\", "/")
+
+    filtered = []
+    for doc in docs:
+        meta = doc.metadata or {}
+        src = str(meta.get("source", "")).lower()
+        typ = str(meta.get("type", "")).lower()
+        feature_key = str(meta.get("feature_key", "")).lower()
+        doc_domain = str(meta.get("doc_domain", "")).lower()
+        rel_path = str(meta.get("relative_source_path", "")).lower().replace("\\", "/")
+        path_text = f"{src} {rel_path}".replace("\\", "/")
+
+        if source_eq_l and src != source_eq_l:
+            continue
+        if source_contains_l and source_contains_l not in src:
+            continue
+        if type_eq_l and typ != type_eq_l:
+            continue
+        if type_prefix_l and not typ.startswith(type_prefix_l):
+            continue
+        if feature_key_eq_l and feature_key != feature_key_eq_l:
+            continue
+        if doc_domain_eq_l and doc_domain != doc_domain_eq_l:
+            continue
+        if path_contains_l and path_contains_l not in path_text:
+            continue
+
+        entry = {"content": doc.page_content}
+        entry.update(meta)
+        filtered.append(entry)
+        if len(filtered) >= top_k:
+            break
+
+    return filtered

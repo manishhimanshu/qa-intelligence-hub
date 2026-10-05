@@ -13,18 +13,18 @@ FAISS_INDEX_PATH = os.getenv("FAISS_INDEX_PATH", "./faiss_index")
 _splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
 
 
-def build_vectorstore(docs: List[Dict], persist: bool = True) -> FAISS:
+def build_vectorstore(docs: List[Dict], persist: bool = True, rebuild: bool = False) -> FAISS:
     """
     Build or update a FAISS vectorstore from a list of doc dicts.
     Each dict must have an 'id' key and either a 'content' key or
     'summary'+'description' keys.  Large 'content' values are automatically
     split into smaller chunks so embeddings stay accurate.
-    Duplicate IDs are skipped so repeated runs are safe.
+    Existing document IDs are skipped unless rebuild is True.
     """
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
     # Load existing index if present
-    if persist and os.path.exists(FAISS_INDEX_PATH):
+    if persist and os.path.exists(FAISS_INDEX_PATH) and not rebuild:
         vs = FAISS.load_local(FAISS_INDEX_PATH, embeddings, allow_dangerous_deserialization=True)
         existing_ids: set = {
             m.metadata.get("id")

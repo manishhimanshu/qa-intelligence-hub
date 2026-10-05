@@ -1,0 +1,9 @@
+mcp>=1.28.0
+pydantic>=2.7
+python-dotenv>=1.0
+requests>=2.31
+langchain-community>=0.3.0
+langchain-huggingface>=1.2.0
+sentence-transformers>=3.0.0
+faiss-cpu>=1.8.0
+truststore>=0.9; sys_platform == "win32"

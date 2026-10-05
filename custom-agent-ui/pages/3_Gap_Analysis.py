@@ -6,8 +6,6 @@ gap-analysis.instructions.md exactly:
   2. Identified Gaps (Functional / Role & Permission / Data Validation /
      State & Edge Case / Integration / Non-Functional)
   3. Questions for the Product Owner
-  4. Test Scope Estimate
-  5. Automation Recommendation
 """
 
 import os
@@ -37,6 +35,8 @@ JIRA_USER      = os.getenv("JIRA_USER", "")
 JIRA_TOKEN     = os.getenv("JIRA_TOKEN", "")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+ROLES = ["admin", "editor", "contributor", "consumer"]
 
 st.set_page_config(page_title="Gap Analysis", page_icon="🔍", layout="wide")
 
@@ -212,9 +212,59 @@ def get_story_content(story_key: str, fallback: str) -> str:
     return fallback
 
 
+def _filter_unstated_gap_items(gap: dict, evidence_text: str) -> tuple[dict, int]:
+    """Remove unsupported inferred scenarios unless explicitly present in story evidence."""
+    if not isinstance(gap, dict):
+        return gap, 0
+
+    evidence = (evidence_text or "").lower()
+    dropped = 0
+
+    guard_terms = [
+        "network failure", "network error", "api failure", "server error", "service unavailable",
+        "timeout", "offline", "500", "502", "503", "504",
+        "concurrent", "simultaneous", "race condition", "parallel edit", "conflict",
+        "performance", "load time", "stress", "high load", "latency",
+        "unsupported browser", "cross-browser", "browser compatibility",
+    ]
+
+    def _keep_item(item: str) -> bool:
+        text = str(item or "").lower()
+        for term in guard_terms:
+            if term in text and term not in evidence:
+                return False
+        return True
+
+    list_keys = [
+        "functional_gaps",
+        "role_permission_gaps",
+        "data_validation_gaps",
+        "state_edge_case_gaps",
+        "integration_gaps",
+        "non_functional_gaps",
+        "cross_story_gaps",
+        "po_questions",
+    ]
+
+    out = dict(gap)
+    for key in list_keys:
+        items = out.get(key)
+        if not isinstance(items, list):
+            continue
+        kept = []
+        for item in items:
+            if _keep_item(str(item)):
+                kept.append(item)
+            else:
+                dropped += 1
+        out[key] = kept
+
+    return out, dropped
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def run_gap_analysis(story_key: str, summary: str, content: str) -> dict:
-    """Call GPT to produce the 5-section gap analysis from instructions."""
+    """Call GPT to produce the 3-section gap analysis from instructions."""
     prompt = f"""You are a QA Architect performing a structured Requirement Gap Analysis for a Kapost Jira story.
 
 Platform context:
@@ -235,8 +285,7 @@ Produce a COMPLETE gap analysis. Return ONLY valid JSON — no markdown fences:
   ],
   "functional_gaps": [
     "Behaviours implied but not specified",
-    "What happens on failure (network error, server 500)",
-    "What happens on concurrent edits",
+        "Missing business behavior that is directly implied by current story text",
     "Is there a confirmation dialog for destructive actions"
   ],
   "role_permission_gaps": [
@@ -273,25 +322,16 @@ Produce a COMPLETE gap analysis. Return ONLY valid JSON — no markdown fences:
     "Q1: What should happen when [scenario from the gaps above]?",
     "Q2: ...",
     "Q3: ..."
-  ],
-  "test_scope": {{
-    "happy_path":          3,
-    "negative_validation": 4,
-    "role_based":          5,
-    "edge_integration":    3,
-    "total":               15,
-    "split_recommended":   false,
-    "split_reason":        ""
-  }},
-  "automation": {{
-    "automate_now":   ["Stable, high-value, repeatable scenario e.g. happy path creation"],
-    "automate_later": ["Valid but lower priority or complex UI scenario"],
-    "manual_only":    ["Exploratory, one-off, or unstable scenario"]
-  }}
+    ]
 }}
 
 Be specific and reference Kapost domain concepts.
-Flag anything not covered in the requirement as a gap — do not assume it is handled."""
+Flag anything not covered in the requirement as a gap — do not assume it is handled.
+
+STRICT REALISM RULES:
+- Only include gap items and PO questions that are directly grounded in this story content.
+- Do NOT invent scenarios that are not present in the story text.
+- Specifically do NOT add network/API failure, timeout/offline, server-error, concurrency, performance, or browser-compatibility items unless explicitly mentioned in the story."""
 
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
@@ -301,7 +341,12 @@ Flag anything not covered in the requirement as a gap — do not assume it is ha
     raw = resp.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw).strip()
-    return json.loads(raw)
+    parsed = json.loads(raw)
+    filtered, dropped = _filter_unstated_gap_items(parsed, content)
+    if dropped:
+        filtered.setdefault("_meta", {})
+        filtered["_meta"]["dropped_unstated_items"] = dropped
+    return filtered
 
 
 def build_markdown_report(story_key: str, summary: str, gap: dict) -> str:
@@ -333,28 +378,6 @@ def build_markdown_report(story_key: str, summary: str, gap: dict) -> str:
     md += "\n## 3. Questions for the Product Owner\n\n"
     for q in gap.get("po_questions", []):
         md += f"- {q}\n"
-
-    scope = gap.get("test_scope", {})
-    md += "\n## 4. Test Scope Estimate\n\n"
-    md += f"- Happy Path cases:           {scope.get('happy_path', 0)}\n"
-    md += f"- Negative / Validation cases: {scope.get('negative_validation', 0)}\n"
-    md += f"- Role-Based cases:            {scope.get('role_based', 0)}\n"
-    md += f"- Edge / Integration cases:    {scope.get('edge_integration', 0)}\n"
-    md += f"\n**Total: {scope.get('total', 0)} test cases**\n"
-    if scope.get("split_recommended"):
-        md += f"\n> ⚠️ **Split recommended:** {scope.get('split_reason', '')}\n"
-
-    auto = gap.get("automation", {})
-    md += "\n## 5. Automation Recommendation\n\n"
-    md += "**Automate Now** (stable, high-value, repeatable):\n"
-    for item in auto.get("automate_now", []):
-        md += f"- {item}\n"
-    md += "\n**Automate Later** (valid but lower priority or UI-heavy):\n"
-    for item in auto.get("automate_later", []):
-        md += f"- {item}\n"
-    md += "\n**Manual Only** (exploratory, one-off, or too unstable):\n"
-    for item in auto.get("manual_only", []):
-        md += f"- {item}\n"
 
     return md
 
@@ -467,24 +490,18 @@ Return ONLY valid JSON — no markdown fences:
   "cross_story_gaps": [
     "Gap spanning multiple stories — e.g. STUD-X defines creation but no story covers deletion"
   ],
-  "po_questions": ["Q1: What should happen when …?", "Q2: …"],
-  "test_scope": {{
-    "happy_path": 0,
-    "negative_validation": 0,
-    "role_based": 0,
-    "edge_integration": 0,
-    "total": 0,
-    "split_recommended": false,
-    "split_reason": ""
-  }},
-  "automation": {{
-    "automate_now":   ["..."],
-    "automate_later": ["..."],
-    "manual_only":    ["..."]
-  }}
+    "po_questions": ["Q1: What should happen when …?", "Q2: …"]
 }}
 
 Be specific. Reference Jira story keys by name (e.g. "STUD-123 does not define…"). Flag anything not covered across all stories as a gap."""
+
+    prompt += """
+
+STRICT REALISM RULES:
+- Only include gap items and PO questions directly grounded in the provided stories.
+- Do NOT invent scenarios not present in the story set.
+- Specifically do NOT add network/API failure, timeout/offline, server-error, concurrency, performance, or browser-compatibility items unless explicitly mentioned in the stories.
+"""
 
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
@@ -494,7 +511,12 @@ Be specific. Reference Jira story keys by name (e.g. "STUD-123 does not define�
     raw = resp.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw).strip()
-    return json.loads(raw)
+    parsed = json.loads(raw)
+    filtered, dropped = _filter_unstated_gap_items(parsed, stories_block)
+    if dropped:
+        filtered.setdefault("_meta", {})
+        filtered["_meta"]["dropped_unstated_items"] = dropped
+    return filtered
 
 
 def build_multi_markdown_report(story_keys: list, epic_key: str, gap: dict) -> str:
@@ -529,28 +551,6 @@ def build_multi_markdown_report(story_keys: list, epic_key: str, gap: dict) -> s
     for q in gap.get("po_questions", []):
         md += f"- {q}\n"
 
-    scope = gap.get("test_scope", {})
-    md += "\n## 4. Test Scope Estimate\n\n"
-    md += f"- Happy Path cases:            {scope.get('happy_path', 0)}\n"
-    md += f"- Negative / Validation cases: {scope.get('negative_validation', 0)}\n"
-    md += f"- Role-Based cases:            {scope.get('role_based', 0)}\n"
-    md += f"- Edge / Integration cases:    {scope.get('edge_integration', 0)}\n"
-    md += f"\n**Total: {scope.get('total', 0)} test cases**\n"
-    if scope.get("split_recommended"):
-        md += f"\n> ⚠️ **Split recommended:** {scope.get('split_reason', '')}\n"
-
-    auto = gap.get("automation", {})
-    md += "\n## 5. Automation Recommendation\n\n"
-    md += "**Automate Now:**\n"
-    for item in auto.get("automate_now", []):
-        md += f"- {item}\n"
-    md += "\n**Automate Later:**\n"
-    for item in auto.get("automate_later", []):
-        md += f"- {item}\n"
-    md += "\n**Manual Only:**\n"
-    for item in auto.get("manual_only", []):
-        md += f"- {item}\n"
-
     return md
 
 
@@ -582,7 +582,8 @@ epic_key_used:    str  = ""
 if mode == "🔹 Single Story":
     story_options  = {f"{s['key']}  —  {s['summary'][:70]}": s for s in stories}
     selected_label = st.selectbox("📋 Select Jira Story", list(story_options.keys()))
-    selected_stories = [story_options[selected_label]]
+    selected_story = story_options[selected_label]
+    selected_stories = [selected_story]
 
 # ── Multiple Stories ──────────────────────────────────────────────────────────
 elif mode == "🔷 Multiple Stories":
@@ -750,46 +751,6 @@ if po_questions:
         st.markdown(f"- {q}")
 else:
     st.info("No PO questions generated.")
-
-# ── Section 4: Test Scope Estimate ────────────────────────────────────────────
-st.subheader("4️⃣ Test Scope Estimate")
-scope = gap.get("test_scope", {})
-if scope:
-    s1, s2, s3, s4, s5 = st.columns(5)
-    s1.metric("Happy Path",          scope.get("happy_path", 0))
-    s2.metric("Negative/Validation", scope.get("negative_validation", 0))
-    s3.metric("Role-Based",          scope.get("role_based", 0))
-    s4.metric("Edge/Integration",    scope.get("edge_integration", 0))
-    s5.metric("Total",               scope.get("total", 0))
-
-    total_tcs = scope.get("total", 0)
-    if scope.get("split_recommended"):
-        st.warning(f"⚠️ **Split recommended:** {scope.get('split_reason', 'Feature is too large for a single sprint.')}")
-    elif total_tcs > 20:
-        st.warning(f"⚠️ **{total_tcs} test cases** — consider splitting (> 20 TCs = risk of under-testing).")
-    else:
-        st.success(f"✅ {total_tcs} test cases — appropriately scoped.")
-
-# ── Section 5: Automation Recommendation ──────────────────────────────────────
-st.subheader("5️⃣ Automation Recommendation")
-auto = gap.get("automation", {})
-if auto:
-    col_a, col_b, col_c = st.columns(3)
-    with col_a:
-        st.markdown("**🚀 Automate Now**")
-        st.caption("Stable, high-value, repeatable — smoke or regression candidates")
-        for item in auto.get("automate_now", []):
-            st.markdown(f"- {item}")
-    with col_b:
-        st.markdown("**⏳ Automate Later**")
-        st.caption("Valid but lower priority or UI-heavy")
-        for item in auto.get("automate_later", []):
-            st.markdown(f"- {item}")
-    with col_c:
-        st.markdown("**👁️ Manual Only**")
-        st.caption("Exploratory, one-off, or too unstable to automate")
-        for item in auto.get("manual_only", []):
-            st.markdown(f"- {item}")
 
 # ── Download ───────────────────────────────────────────────────────────────────
 st.divider()

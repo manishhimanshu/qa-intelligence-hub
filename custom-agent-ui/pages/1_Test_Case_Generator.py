@@ -37,6 +37,7 @@ TESTRAIL_PROJECT_ID = int(os.getenv("TESTRAIL_PROJECT_ID", "2"))
 JIRA_URL            = os.getenv("JIRA_URL", "").rstrip("/")
 JIRA_USER           = os.getenv("JIRA_USER", "")
 JIRA_TOKEN          = os.getenv("JIRA_TOKEN", "")
+AUTOMATION_REPO_ROOT = os.getenv("AUTOMATION_REPO_ROOT", "").strip()
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -100,6 +101,783 @@ st.set_page_config(page_title="Test Case Generator", page_icon="📝", layout="w
 def rag_query(query: str, top_k: int = 20) -> list:
     from get_relevant_docs import get_relevant_docs
     return get_relevant_docs(query, top_k=top_k)
+
+
+def rag_query_filtered(
+    query: str,
+    top_k: int = 10,
+    source_eq: str = "",
+    source_contains: str = "",
+    type_eq: str = "",
+    type_prefix: str = "",
+    feature_key_eq: str = "",
+    doc_domain_eq: str = "",
+    path_contains: str = "",
+) -> list:
+    try:
+        from get_relevant_docs import get_relevant_docs_filtered
+
+        return get_relevant_docs_filtered(
+            query,
+            top_k=top_k,
+            source_eq=source_eq,
+            source_contains=source_contains,
+            type_eq=type_eq,
+            type_prefix=type_prefix,
+            feature_key_eq=feature_key_eq,
+            doc_domain_eq=doc_domain_eq,
+            path_contains=path_contains,
+        )
+    except Exception:
+        return rag_query(query, top_k=top_k)
+
+
+def _normalize_feature_key(value: str) -> str:
+    value = (value or "").strip().lower().replace("_", "-").replace(" ", "-")
+    value = re.sub(r"-+", "-", value)
+    return value
+
+
+@st.cache_data(show_spinner=False)
+def load_feature_aliases() -> dict:
+    """Load canonical feature aliases used for deterministic feature-scoped retrieval."""
+    path = os.path.join(_DIR, "../../rag/docs/automation/feature-context/feature-aliases.json")
+    defaults = {
+        "notes": ["notes", "note"],
+        "archive-content-type": [
+            "archive-content-type",
+            "archived-content-type",
+            "archived_content_type",
+            "archive content type",
+            "archived content type",
+        ],
+    }
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            out = {}
+            for k, aliases in raw.items():
+                canon = _normalize_feature_key(k)
+                vals = aliases if isinstance(aliases, list) else [str(aliases)]
+                vals = [_normalize_feature_key(v) for v in vals if str(v).strip()]
+                out[canon] = sorted(set([canon] + vals))
+            return out or defaults
+    except Exception:
+        pass
+    return defaults
+
+
+def resolve_feature_key(summary: str, feature_prefix: str = "", extra_text: str = "") -> str:
+    text = _normalize_feature_key(f"{summary} {feature_prefix} {extra_text}")
+    aliases = load_feature_aliases()
+    for canon, words in aliases.items():
+        for token in words:
+            if not token:
+                continue
+            if re.search(rf"(^|-)({re.escape(token)})(-|$)", text):
+                return canon
+    return ""
+
+
+@st.cache_data(show_spinner=False)
+def load_automation_guidelines() -> str:
+    path = os.path.join(_DIR, "../../rag/docs/automation/automation-guidelines.md")
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def _compact_chunks(docs: list, max_items: int = 5, max_chars: int = 650) -> list:
+    snippets = []
+    for doc in docs[:max_items]:
+        path = doc.get("repo_path") or doc.get("source") or doc.get("id", "unknown")
+        content = (doc.get("content") or "").strip()
+        if not content:
+            continue
+        snippets.append({
+            "path": str(path),
+            "snippet": content[:max_chars],
+            "id": doc.get("id", ""),
+            "type": doc.get("type", ""),
+        })
+    return snippets
+
+
+def _exclude_guidelines_docs(docs: list) -> list:
+    """Avoid duplicating automation-guidelines in both RAG context and direct prompt injection."""
+    filtered = []
+    for doc in docs:
+        path = str(doc.get("repo_path") or doc.get("source") or "").lower().replace("\\", "/")
+        if path.endswith("automation/automation-guidelines.md"):
+            continue
+        if path.endswith("qa/automation-guidelines.md"):
+            continue
+        filtered.append(doc)
+    return filtered
+
+
+def _docstore_feature_chunks(
+    feature_key: str,
+    doc_domain: str,
+    path_contains: str,
+    max_items: int = 6,
+    query_hint: str = "",
+) -> list:
+    """
+    Deterministic fallback: read matching chunks directly from FAISS docstore
+    metadata when semantic top-k misses feature-scoped docs.
+    """
+    if not feature_key:
+        return []
+
+    try:
+        vs = _load_vectorstore()
+    except Exception:
+        return []
+    if vs is None or not hasattr(vs, "docstore"):
+        return []
+
+    q_tokens = {
+        t for t in re.split(r"\W+", (query_hint or "").lower()) if len(t) > 3
+    }
+    path_contains_l = (path_contains or "").lower()
+    domain_l = (doc_domain or "").lower()
+    feature_l = (feature_key or "").lower()
+
+    scored = []
+    for d in vs.docstore._dict.values():
+        if not hasattr(d, "metadata"):
+            continue
+        meta = d.metadata or {}
+        mk = str(meta.get("feature_key", "")).lower()
+        md = str(meta.get("doc_domain", "")).lower()
+        rel = str(meta.get("relative_source_path", "")).lower().replace("\\", "/")
+        src = str(meta.get("source", "")).lower().replace("\\", "/")
+        path_text = f"{rel} {src}"
+
+        if mk != feature_l:
+            continue
+        if domain_l and md != domain_l:
+            continue
+        if path_contains_l and path_contains_l not in path_text:
+            continue
+
+        content = getattr(d, "page_content", "") or ""
+        content_l = content.lower()
+        score = 0
+        if q_tokens:
+            score += sum(1 for t in q_tokens if t in content_l)
+        if feature_l and feature_l in content_l:
+            score += 2
+        if meta.get("heading"):
+            score += 1
+        scored.append((score, {
+            "content": content,
+            **meta,
+        }))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [x[1] for x in scored[:max_items]]
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def get_feature_context_chunks(
+    summary: str,
+    feature_prefix: str,
+    case_context_text: str = "",
+    forced_feature_key: str = "",
+    top_k_each: int = 4,
+) -> dict:
+    feature_key = _normalize_feature_key(forced_feature_key) if forced_feature_key else \
+        resolve_feature_key(summary, feature_prefix, case_context_text)
+    if not feature_key:
+        return {"feature_key": "", "chunks": []}
+
+    query = f"{summary} {feature_key} {case_context_text[:500]} feature context"
+    docs = rag_query_filtered(
+        query,
+        top_k=top_k_each,
+        doc_domain_eq="automation_feature_context",
+        feature_key_eq=feature_key,
+        path_contains="automation/feature-context",
+    )
+    if not docs:
+        docs = _docstore_feature_chunks(
+            feature_key=feature_key,
+            doc_domain="automation_feature_context",
+            path_contains="automation/feature-context",
+            max_items=top_k_each,
+            query_hint=f"{summary} {case_context_text[:300]}",
+        )
+    docs = _exclude_guidelines_docs(docs)
+    return {
+        "feature_key": feature_key,
+        "chunks": _compact_chunks(docs, max_items=top_k_each, max_chars=700),
+    }
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def get_product_knowledge_chunks(
+    summary: str,
+    feature_prefix: str,
+    extra_text: str = "",
+    forced_feature_key: str = "",
+    top_k_each: int = 6,
+) -> dict:
+    """
+    Return only feature-scoped product knowledge context (md/pdf) for test generation.
+    No cross-feature fallback is applied.
+    """
+    feature_key = _normalize_feature_key(forced_feature_key) if forced_feature_key else \
+        resolve_feature_key(summary, feature_prefix, extra_text)
+    if not feature_key:
+        return {"feature_key": "", "chunks": []}
+
+    query = f"{summary} {feature_key} {extra_text[:500]} product knowledge"
+    docs = rag_query_filtered(
+        query,
+        top_k=top_k_each,
+        doc_domain_eq="product_knowledge",
+        feature_key_eq=feature_key,
+        path_contains="product_knowledge",
+    )
+    if not docs:
+        docs = _docstore_feature_chunks(
+            feature_key=feature_key,
+            doc_domain="product_knowledge",
+            path_contains="product_knowledge",
+            max_items=top_k_each,
+            query_hint=f"{summary} {extra_text[:300]}",
+        )
+    if not docs:
+        return {"feature_key": feature_key, "chunks": []}
+
+    return {
+        "feature_key": feature_key,
+        "chunks": _compact_chunks(docs, max_items=top_k_each, max_chars=500),
+    }
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def get_product_knowledge_context(
+    summary: str,
+    feature_prefix: str,
+    extra_text: str = "",
+    forced_feature_key: str = "",
+    top_k_each: int = 6,
+) -> str:
+    bundle = get_product_knowledge_chunks(
+        summary,
+        feature_prefix,
+        extra_text,
+        forced_feature_key,
+        top_k_each,
+    )
+    snippets = bundle.get("chunks", [])
+    if not snippets:
+        return ""
+    return "\n\n".join(
+        f"[{s.get('path', 'unknown')}]\n{s.get('snippet', '')}" for s in snippets
+    )
+
+
+@st.cache_data(show_spinner="Retrieving automation framework context…", ttl=1800)
+def get_automation_context(
+    summary: str,
+    case_titles: tuple,
+    feature_prefix: str,
+    case_context_text: str = "",
+    forced_feature_key: str = "",
+    top_k_each: int = 5,
+) -> dict:
+    query = summary
+    if case_titles:
+        query = f"{summary} " + " | ".join(case_titles[:8])
+    if case_context_text:
+        query = f"{query} {case_context_text[:500]}"
+
+    feature_ctx = get_feature_context_chunks(
+        summary,
+        feature_prefix,
+        case_context_text,
+        forced_feature_key,
+        top_k_each=top_k_each,
+    )
+
+    spec_docs = rag_query_filtered(query, top_k=top_k_each, type_eq="automation_spec")
+    spec_docs = _exclude_guidelines_docs(spec_docs)
+    if not spec_docs:
+        spec_docs = rag_query_filtered(query, top_k=top_k_each, type_eq="cypress_spec")
+        spec_docs = _exclude_guidelines_docs(spec_docs)
+
+    po_docs = rag_query_filtered(query, top_k=top_k_each, type_eq="automation_page_object")
+    po_docs = _exclude_guidelines_docs(po_docs)
+    if not po_docs:
+        po_docs = rag_query_filtered(query, top_k=top_k_each, type_eq="cypress_page_object")
+        po_docs = _exclude_guidelines_docs(po_docs)
+
+    cmd_docs = rag_query_filtered(query, top_k=top_k_each, type_eq="automation_command")
+    cmd_docs = _exclude_guidelines_docs(cmd_docs)
+    if not cmd_docs:
+        cmd_docs = rag_query_filtered(query, top_k=top_k_each, type_eq="cypress_command")
+        cmd_docs = _exclude_guidelines_docs(cmd_docs)
+
+    data_docs = rag_query_filtered(query, top_k=top_k_each, type_prefix="automation_data")
+    data_docs = _exclude_guidelines_docs(data_docs)
+    if not data_docs:
+        data_docs = rag_query_filtered(query, top_k=top_k_each, type_eq="automation_fixture")
+        data_docs = _exclude_guidelines_docs(data_docs)
+
+    return {
+        "feature_key": feature_ctx.get("feature_key", ""),
+        "feature_context": feature_ctx.get("chunks", []),
+        "similar_specs": _compact_chunks(spec_docs),
+        "page_objects": _compact_chunks(po_docs),
+        "custom_commands": _compact_chunks(cmd_docs),
+        "test_data_patterns": _compact_chunks(data_docs),
+    }
+
+
+def _normalize_automation_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return {
+            "spec_file": {"path": "", "content": ""},
+            "page_object_updates": [],
+            "command_suggestions": [],
+            "patch_blocks": [],
+            "grounding_evidence": [],
+            "similar_spec_style_guide": {
+                "style_rules": [],
+                "must_reuse_patterns": [],
+                "cautions": [],
+            },
+        }
+
+    spec_file = payload.get("spec_file") or {}
+    if not isinstance(spec_file, dict):
+        spec_file = {"path": "", "content": str(spec_file)}
+
+    return {
+        "spec_file": {
+            "path": spec_file.get("path", ""),
+            "content": spec_file.get("content", ""),
+        },
+        "page_object_updates": payload.get("page_object_updates", []) or [],
+        "command_suggestions": payload.get("command_suggestions", []) or [],
+        "patch_blocks": payload.get("patch_blocks", []) or [],
+        "grounding_evidence": payload.get("grounding_evidence", []) or [],
+        "feature_context_application": payload.get("feature_context_application", []) or [],
+        "similar_spec_style_guide": payload.get("similar_spec_style_guide", {
+            "style_rules": [],
+            "must_reuse_patterns": [],
+            "cautions": [],
+        }) or {
+            "style_rules": [],
+            "must_reuse_patterns": [],
+            "cautions": [],
+        },
+    }
+
+
+def generate_automation_code(
+    story_key: str,
+    summary: str,
+    feature_prefix: str,
+    selected_cases_json: str,
+    automation_context_json: str,
+    guidelines_text: str,
+) -> dict:
+    def _has_naked_locators(spec_text: str) -> bool:
+        """
+        Specs should avoid raw selectors directly in test bodies.
+        Locators must be routed via page-object methods/variables.
+        """
+        if not spec_text:
+            return True
+        return bool(re.search(r"\bcy\.get\s*\(", spec_text))
+
+    def _filter_command_suggestions_data_only(candidate: dict) -> dict:
+        """
+        Keep only data-lifecycle/API custom command suggestions.
+        UI-flow commands belong in page objects and should be removed.
+        """
+        cmds = candidate.get("command_suggestions", []) or []
+        kept = []
+        dropped = 0
+
+        api_keywords = (
+            "api", "request", "endpoint", "post", "put", "delete", "get",
+            "create", "seed", "cleanup", "teardown", "fixture", "data",
+            "book", "entity", "record", "reset", "remove",
+        )
+        ui_keywords = (
+            "click", "hover", "type", "press", "open", "close", "select", "drag",
+            "dropdown", "button", "modal", "tooltip", "toolbar", "navigate", "tab",
+            "ui", "screen", "page interaction", "render", "visible",
+        )
+
+        for cmd in cmds:
+            if not isinstance(cmd, dict):
+                continue
+            text = "\n".join([
+                str(cmd.get("command", "") or ""),
+                str(cmd.get("rationale", "") or ""),
+                str(cmd.get("sample", "") or ""),
+            ]).lower()
+
+            has_api = any(k in text for k in api_keywords)
+            has_ui = any(k in text for k in ui_keywords)
+
+            # Keep only API/data-lifecycle suggestions; drop UI/local-flow helpers.
+            if has_api and not has_ui:
+                kept.append(cmd)
+            elif has_api and has_ui:
+                # If both appear, keep only when rationale is explicitly data lifecycle.
+                if any(k in text for k in ("data creation", "data cleanup", "setup", "teardown", "seed")):
+                    kept.append(cmd)
+                else:
+                    dropped += 1
+            else:
+                dropped += 1
+
+        candidate["command_suggestions"] = kept
+        if dropped:
+            candidate.setdefault("_meta", {})
+            candidate["_meta"]["dropped_ui_custom_command_suggestions"] = dropped
+        return candidate
+
+    def _drop_existing_page_object_implementation_updates(candidate: dict) -> dict:
+        """
+        Safety filter: if a page object file already exists in the repo, do not
+        keep suggestions that ask to implement/create that page object.
+        """
+        updates = candidate.get("page_object_updates", []) or []
+        kept = []
+        dropped = 0
+        for upd in updates:
+            if not isinstance(upd, dict):
+                continue
+            rel_path = str(upd.get("path", "") or "").strip().replace("\\", "/")
+            summary = str(upd.get("summary", "") or "")
+            patch = str(upd.get("patch", "") or "")
+
+            abs_path = ""
+            if rel_path:
+                if os.path.isabs(rel_path):
+                    abs_path = rel_path
+                elif AUTOMATION_REPO_ROOT:
+                    abs_path = os.path.join(AUTOMATION_REPO_ROOT, rel_path.replace("/", os.sep))
+
+            exists = bool(abs_path and os.path.exists(abs_path))
+            text = f"{summary}\n{patch}".lower()
+            asks_implement = any(
+                kw in text for kw in (
+                    "implement",
+                    "create page object",
+                    "new page object",
+                    "create class",
+                    "define class",
+                    "add page object",
+                )
+            )
+
+            if exists and asks_implement:
+                dropped += 1
+                continue
+            kept.append(upd)
+
+        candidate["page_object_updates"] = kept
+        if dropped:
+            candidate.setdefault("_meta", {})
+            candidate["_meta"]["dropped_existing_po_implementation_updates"] = dropped
+        return candidate
+
+    def _derive_spec_style_guide(context_payload: dict) -> dict:
+        """
+        Additional LLM pass: review similar spec chunks only and derive a
+        concrete style guide to follow during code generation.
+        """
+        similar_specs = context_payload.get("similar_specs", []) or []
+        if not similar_specs:
+            return {
+                "style_rules": [],
+                "must_reuse_patterns": [],
+                "cautions": [],
+            }
+
+        spec_samples = []
+        for item in similar_specs[:4]:
+            spec_samples.append({
+                "path": item.get("path", ""),
+                "snippet": (item.get("snippet", "") or "")[:900],
+            })
+
+        style_prompt = f"""
+You are reviewing existing Cypress SPEC files only (not page objects, not custom commands) to extract authoring style.
+
+Similar spec samples:
+{json.dumps(spec_samples, ensure_ascii=True)}
+
+Return ONLY valid JSON with keys:
+{{
+  "style_rules": ["clear style rules to follow in new spec"],
+  "must_reuse_patterns": ["specific patterns to mirror from the sampled specs"],
+  "cautions": ["anti-patterns or mistakes to avoid based on samples"]
+}}
+"""
+        try:
+            style_res = client.chat.completions.create(
+                model=st.session_state.selected_model,
+                response_format={"type": "json_object"},
+                messages=[{"role": "user", "content": style_prompt}],
+                temperature=0.0,
+                max_tokens=1200,
+            )
+            raw_style = (style_res.choices[0].message.content or "{}").strip()
+            out = json.loads(raw_style)
+            if not isinstance(out, dict):
+                return {"style_rules": [], "must_reuse_patterns": [], "cautions": []}
+            return {
+                "style_rules": out.get("style_rules", []) or [],
+                "must_reuse_patterns": out.get("must_reuse_patterns", []) or [],
+                "cautions": out.get("cautions", []) or [],
+            }
+        except Exception:
+            return {
+                "style_rules": [],
+                "must_reuse_patterns": [],
+                "cautions": [],
+            }
+
+    def _extract_must_apply_items(context_payload: dict, max_items: int = 10) -> list:
+        """
+        Pull concise actionable lines from feature-context chunks so the model
+        has an explicit checklist to apply.
+        """
+        items = []
+        for chunk in context_payload.get("feature_context", []) or []:
+            snippet = (chunk.get("snippet") or "").strip()
+            if not snippet:
+                continue
+            for line in snippet.splitlines():
+                s = line.strip().lstrip("- ").strip()
+                if len(s) < 12:
+                    continue
+                if s.lower().startswith(("#", "##", "###", "purpose", "scope")):
+                    continue
+                items.append(s)
+                if len(items) >= max_items:
+                    return items
+        return items
+
+    def _looks_basic(candidate: dict, selected_cases_count: int) -> bool:
+        spec = ((candidate.get("spec_file") or {}).get("content") or "").strip()
+        if not spec:
+            return True
+
+        it_count = len(re.findall(r"\bit\s*\(", spec))
+        has_setup = bool(re.search(r"\bbefore(?:Each)?\s*\(", spec))
+        has_cleanup = bool(re.search(r"\bafter(?:Each)?\s*\(", spec))
+        has_assert = ("expect(" in spec) or ("should(" in spec)
+        has_intercept = ("cy.intercept(" in spec) or ("@" in spec and "wait(" in spec)
+        fc_usage = candidate.get("feature_context_application", []) or []
+
+        # If we selected multiple cases but generated only one/no tests, force refinement.
+        if selected_cases_count >= 2 and it_count < 2:
+            return True
+        if not has_setup or not has_cleanup or not has_assert:
+            return True
+        # At least one network assertion/wait should exist for most robust e2e specs.
+        if not has_intercept:
+            return True
+        if len(fc_usage) < 2:
+            return True
+        if _has_naked_locators(spec):
+            return True
+        return False
+
+    try:
+        _ctx_obj = json.loads(automation_context_json)
+    except Exception:
+        _ctx_obj = {}
+
+    _spec_style_guide = _derive_spec_style_guide(_ctx_obj)
+    _must_apply_items = _extract_must_apply_items(_ctx_obj)
+    _similar_specs = _ctx_obj.get("similar_specs", []) or []
+    _similar_spec_paths = [s.get("path", "") for s in _similar_specs if s.get("path")]
+    _existing_po_paths = [
+        p.get("path", "") for p in (_ctx_obj.get("page_objects", []) or []) if p.get("path")
+    ]
+
+    try:
+        _selected_count = len(json.loads(selected_cases_json))
+    except Exception:
+        _selected_count = 1
+
+    sys_prompt = (
+        "You are a Senior Cypress automation engineer for this repository. "
+        "Generate code grounded in provided context only. Do not invent custom commands, "
+        "page object methods, fixture names, or APIs. If context is missing, emit explicit TODOs. "
+        "Never use naked cy.get(...) locators inside spec tests."
+    )
+
+    user_prompt = f"""
+Generate production-grade Cypress automation artifacts from selected test cases.
+
+Do not return a toy/basic script. The output must be framework-realistic and maintainable.
+
+QUALITY BAR (mandatory):
+- Cover each selected manual test case with explicit traceability (in comments or test titles).
+- Use robust setup and cleanup hooks (before/beforeEach/after) aligned to project patterns.
+- Use page objects and custom commands from provided context where applicable.
+- Include deterministic waits with intercept aliases when network dependencies exist.
+- Add strong assertions for UI state + data/persistence outcomes.
+- Avoid hardcoded brittle waits; prefer intercept/waits by alias.
+- Keep selectors and command names grounded to provided context only.
+- If a required method/command is unknown, add explicit TODO with source gap note.
+- Do not use naked selectors in spec tests (for example cy.get('[data-cy="..."]')).
+- Place selectors in page objects as wrapped methods/functions or page-object variables.
+- Reuse existing locator wrappers first by checking:
+    1) commonPageObjectsAndUtils.cy.js
+    2) the current feature page object file (for example contentTypePage.cy.js)
+    Only add a new page-object locator wrapper when no suitable existing one is found.
+
+MANDATORY FEATURE CONTEXT UTILIZATION:
+- Review and apply all relevant items from the feature-context checklist below.
+- If any checklist item is not applied, add a reason in feature_context_application.
+
+Feature-context checklist (apply where relevant):
+{json.dumps(_must_apply_items, ensure_ascii=True)}
+
+Similar spec paths:
+{json.dumps(_similar_spec_paths, ensure_ascii=True)}
+
+Existing page object files (already implemented — DO NOT ask to implement these):
+{json.dumps(_existing_po_paths, ensure_ascii=True)}
+
+SPEC AUTHORING STYLE GUIDE (derived from similar specs — must follow):
+{json.dumps(_spec_style_guide, ensure_ascii=True)}
+
+Story: {story_key}
+Summary: {summary}
+Feature Prefix: {feature_prefix}
+
+Selected Test Cases JSON:
+{selected_cases_json}
+
+Automation RAG Context JSON:
+{automation_context_json}
+
+Mandatory framework instructions (follow strictly):
+{guidelines_text}
+
+Return strict JSON object with keys:
+1) spec_file: {{ path: string, content: string }}
+2) page_object_updates: [{{ path: string, summary: string, patch: string }}]
+3) command_suggestions: [{{ command: string, rationale: string, sample: string }}]
+4) grounding_evidence: [{{ artifact: string, source_path: string, reason: string }}]
+5) feature_context_application: [{{ context_item: string, applied_in: string, note: string }}]
+
+Output expectations:
+- Prefer one spec file in spec_file that is runnable in this framework.
+- Use Given/When/Then style comments only when already used by nearby specs.
+- Reuse existing command and page-object naming from context.
+- Include setup/cleanup where context indicates required data lifecycle.
+- Keep code complete and syntactically valid JavaScript/TypeScript based on context.
+- Include multiple it(...) blocks when multiple selected test cases are provided.
+- Ensure each it(...) has at least one assertion.
+- Include a short traceability mapping comment block at top of spec.
+- Match describe/it/hook/assertion style to the similar specs style guide above.
+- If a page object file already exists, do NOT output an implementation task for it in page_object_updates.
+- For existing page objects, reuse methods in spec or propose minimal patch only when strictly necessary.
+- Do not write cy.get(...) directly inside it(...) test bodies.
+- If a selector is needed, expose it in page object first (method/function or variable per repository pattern), then call that abstraction in spec.
+- command_suggestions must include only API-based data setup/cleanup helpers (create/delete/seed/reset).
+- Do NOT suggest UI interaction custom commands; UI/local-flow helpers belong in page objects/specs.
+"""
+
+    res = client.chat.completions.create(
+        model=st.session_state.selected_model,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.1,
+        max_tokens=5000,
+    )
+    raw = (res.choices[0].message.content or "{}").strip()
+    try:
+        data = json.loads(raw)
+    except Exception:
+        data = {}
+
+    normalized = _normalize_automation_payload(data)
+    normalized = _drop_existing_page_object_implementation_updates(normalized)
+    normalized = _filter_command_suggestions_data_only(normalized)
+
+    if _looks_basic(normalized, _selected_count):
+        improve_prompt = f"""
+Refine this generated automation payload so it meets senior QA automation standards.
+
+Story: {story_key}
+Summary: {summary}
+Feature Prefix: {feature_prefix}
+Selected test cases count: {_selected_count}
+
+Selected Test Cases JSON:
+{selected_cases_json}
+
+Automation RAG Context JSON:
+{automation_context_json}
+
+Mandatory framework instructions:
+{guidelines_text}
+
+Spec authoring style guide derived from similar specs:
+{json.dumps(_spec_style_guide, ensure_ascii=True)}
+
+Current payload to improve:
+{json.dumps(normalized, ensure_ascii=True)}
+
+Improve it with these non-negotiables:
+1. Non-basic spec with realistic setup, execution, and teardown.
+2. Explicit coverage for selected cases.
+3. Intercepts/alias waits where applicable.
+4. Strong assertions in each test.
+5. Grounded commands/page-object methods only.
+6. Explicit feature_context_application with actionable usage (or reason not used).
+7. Never propose implementing a page object that already exists; only reuse or minimally patch.
+8. Remove all naked cy.get(...) usage from spec test bodies.
+9. Reuse existing locator wrappers from commonPageObjectsAndUtils.cy.js and current feature page object first; add only minimal new page-object wrappers when missing.
+
+Return strict JSON with the same schema keys only.
+"""
+        retry = client.chat.completions.create(
+            model=st.session_state.selected_model,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": improve_prompt},
+            ],
+            temperature=0.05,
+            max_tokens=5500,
+        )
+        retry_raw = (retry.choices[0].message.content or "{}").strip()
+        try:
+            retry_data = json.loads(retry_raw)
+            normalized = _normalize_automation_payload(retry_data)
+            normalized = _drop_existing_page_object_implementation_updates(normalized)
+            normalized = _filter_command_suggestions_data_only(normalized)
+        except Exception:
+            pass
+
+    normalized["similar_spec_style_guide"] = _spec_style_guide
+
+    return normalized
 
 
 def _adf_to_markdown(node) -> str:
@@ -725,10 +1503,18 @@ def normalize_ticket(
         primary_source = "none"
         requirements   = []
 
+    feature_prefix = detect_feature_prefix(summary)
+    feature_key = resolve_feature_key(
+        summary,
+        feature_prefix,
+        f"{description} {' '.join(ac)} {' '.join(steps)} {comments}",
+    )
+
     return {
         "ticket_key":     story_key,
         "ticket_type":    ticket_type,
         "summary":        summary,
+        "feature_key":    feature_key,
         "primary_source": primary_source,   # "ac" | "str" | "description" | "none"
         "requirements":   requirements,     # authoritative list, source-agnostic
         "steps_to_reproduce": steps,        # always preserved separately
@@ -814,12 +1600,20 @@ Return ONLY valid JSON — no markdown fences, no explanation:
     "Clear, unambiguous restatement of each requirement. One sentence per item."
   ],
   "edge_cases": [
-    "Boundary values, empty input states, max/min limits, special characters, concurrent actions.",
+    "Generate edge cases ONLY when directly applicable to the requirement.
+        Do not invent:
+        - performance tests
+        - unsupported browser tests
+        - offline tests
+        - concurrency tests
+        - stress tests
+    unless explicitly mentioned in requirements, acceptance criteria, comments, or story context."
     "IMPORTANT: For any search, filter, or list feature also include: zero-results / no-match state (valid query that returns no results), single-result state, and maximum-results state."
   ],
   "negative_scenarios": [
     "Invalid inputs, unauthorised access, missing required fields, wrong data types.",
-    "IMPORTANT: For search/filter features also include: query that matches nothing (no results found), query that partially matches, query with only whitespace."
+        "IMPORTANT: For search/filter features also include: query that matches nothing (no results found), query that partially matches, query with only whitespace.",
+        "Do NOT include network/API failure, timeout, offline, server-error, concurrency, performance, or browser-compatibility scenarios unless explicitly stated in requirements, AC, STR, comments, or description."
   ],
   "validation_rules": [
     "Field-level rules, format constraints, state machine rules, dependent field logic."
@@ -838,7 +1632,7 @@ Return ONLY valid JSON — no markdown fences, no explanation:
 }}"""
 
     resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
+        model=st.session_state.selected_model,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.1,
         max_tokens=2000,
@@ -846,7 +1640,307 @@ Return ONLY valid JSON — no markdown fences, no explanation:
     raw = resp.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw).strip()
-    return json.loads(raw)
+    out = json.loads(raw)
+    if isinstance(out, dict) and not out.get("feature_key"):
+        out["feature_key"] = ticket.get("feature_key", "")
+    return out
+
+
+def _resequence_case_ids(cases: list, feature_prefix: str) -> list:
+    resequenced = []
+    for idx, case in enumerate(cases, 1):
+        updated = dict(case)
+        updated["tc_id"] = f"{feature_prefix}-{idx:03d}"
+        resequenced.append(updated)
+    return resequenced
+
+
+def _drop_unstated_scenarios(cases: list, story_evidence_text: str) -> tuple[list, int]:
+    """Drop generated cases for scenarios not explicitly present in story evidence."""
+    evidence = (story_evidence_text or "").lower()
+    if not cases:
+        return [], 0
+
+    guard_terms = {
+        "network_failure": [
+            "network failure", "network error", "connection lost", "offline",
+            "server error", "api failure", "timeout", "service unavailable",
+            "500", "502", "503", "504",
+        ],
+        "concurrency": ["concurrent", "simultaneous", "race condition", "parallel edit", "conflict"],
+        "performance": ["performance", "load time", "stress", "high load", "latency"],
+        "browser": ["unsupported browser", "cross-browser", "browser compatibility"],
+    }
+
+    kept, dropped = [], 0
+    for case in cases:
+        text = "\n".join([
+            str(case.get("title", "") or ""),
+            str(case.get("preconditions", "") or ""),
+            str(case.get("steps", "") or ""),
+            str(case.get("expected_result", "") or ""),
+        ]).lower()
+
+        unsupported = False
+        for terms in guard_terms.values():
+            if any(term in text for term in terms) and not any(term in evidence for term in terms):
+                unsupported = True
+                break
+
+        if unsupported:
+            dropped += 1
+            continue
+        kept.append(case)
+
+    return kept, dropped
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def refine_generated_cases(
+    cases_json: str,
+    requirements_json: str,
+    feature_prefix: str,
+    critique_json: str = "{}",
+) -> list:
+    """Principal-QA final review pass using requirements and optional critique findings."""
+    # Format critique findings as explicit action items so the model receives
+    # concrete instructions rather than a raw JSON blob.
+    _critique_section = ""
+    try:
+        _crit = json.loads(critique_json) if critique_json and critique_json != "{}" else {}
+    except Exception:
+        _crit = {}
+    if _crit:
+        _crit_lines = ["====================================================",
+                       "MANDATORY FIXES FROM PREVIOUS CRITIQUE PASS",
+                       "You MUST address every item below before returning the final suite.",
+                       "===================================================="]
+        _missing = _crit.get("missing_coverage", [])
+        if _missing:
+            _crit_lines.append("\nMISSING COVERAGE — add test cases for each of these:")
+            for _m in _missing:
+                _crit_lines.append(f"  ✗ {_m}")
+        _dups = _crit.get("duplicate_pairs", [])
+        if _dups:
+            _crit_lines.append("\nDUPLICATE PAIRS — merge or remove one from each pair:")
+            for _pair in _dups:
+                _crit_lines.append(f"  ✗ {' ↔ '.join(_pair) if isinstance(_pair, list) else _pair}")
+        _suggestions = _crit.get("improvement_suggestions", [])
+        if _suggestions:
+            _crit_lines.append("\nIMPROVEMENT SUGGESTIONS — apply each one:")
+            for _s in _suggestions:
+                _crit_lines.append(f"  ✗ {_s}")
+        _crit_lines.append("\nDo not return the suite until all items above are resolved.\n")
+        _critique_section = "\n".join(_crit_lines)
+
+    prompt = f"""You are a Principal QA Engineer performing a FINAL QUALITY REVIEW of AI-generated test cases.
+
+IMPORTANT:
+Do NOT blindly accept the generated test cases.
+
+Your job is to act as a QA reviewer and improve the test suite before it is returned.
+
+You may:
+- Rewrite test cases
+- Split test cases
+- Merge test cases
+- Remove test cases
+- Add missing test cases
+
+Your goal is to produce a high-quality, non-overlapping, realistic, and executable test suite.
+
+Requirements Brief (source of truth):
+{requirements_json}
+
+IMPORTANT:
+
+Use the requirements brief as the source of truth.
+
+For every test case ask:
+
+1. Can this test case be directly traced to a requirement,
+   edge case, validation rule, or negative scenario?
+
+2. Is any requirement missing coverage?
+
+3. Is this test case inventing behavior not present in
+   the requirements?
+
+If a test case cannot be traced to a requirement,
+remove it.
+
+Current Generated Cases:
+{cases_json}
+
+{_critique_section}
+====================================================
+QUALITY CHECKS
+====================================================
+
+1. DUPLICATE COVERAGE DETECTION
+- Detect overlapping scenarios.
+- Merge test cases that validate the same workflow, UI area, or acceptance criteria.
+- Avoid separate test cases when preconditions, steps, and expected outcomes substantially overlap.
+- Keep the most complete version when duplicates exist.
+
+Rule:
+Every requirement should ideally be tested once unless different user workflows require separate validation.
+
+2. REMOVE ARTIFICIAL EDGE CASES
+- Remove unrealistic or AI-invented scenarios.
+- Do not keep impossible user actions (for example: simultaneous hovering/clicking of multiple controls).
+
+Allowed edge cases include only realistic ones such as:
+- Empty/null/invalid values
+- Maximum/minimum limits
+- Unsupported file types
+- Permission restrictions
+- Browser refresh / save and reload
+- User cancellation flows
+- Realistic user mistakes
+
+3. REMOVE GENERIC EXPECTED RESULTS
+- Expected results must be explicit, measurable, and independently verifiable.
+- Forbidden vague phrases include:
+  - Works correctly
+  - Behaves as expected
+  - Validation works
+  - Displays properly
+  - No errors occur
+  - Functionality succeeds
+  - System handles correctly
+
+4. EXPECTED RESULTS MUST ALWAYS BE NUMBERED
+- expected_result must always be numbered lines:
+  1. ...
+  2. ...
+  3. ...
+- Never return expected results as a paragraph.
+
+5. VERIFY TESTABILITY
+- Every expected result must be objectively verifiable.
+- A tester must be able to determine PASS or FAIL.
+
+6. SPLIT OVERSIZED TEST CASES
+- If one test case validates more than 5 independent behaviors, split it.
+- Keep cases focused so one failing requirement does not invalidate unrelated checks.
+
+7. REMOVE UNSUPPORTED ASSUMPTIONS
+- Do not invent behavior not supported by available information.
+- If behavior is not defined, use neutral, verifiable assertions rather than product guesses.
+
+8. REQUIREMENT TRACEABILITY REVIEW
+- Verify coverage_refs are actually covered by the case steps and expected results.
+- Remove incorrect refs and add clearly applicable missing refs.
+
+9. ADD MISSING HIGH-VALUE TESTS WHEN APPLICABLE
+- Save/reload persistence
+- Edit/update/delete existing content
+- Copy/paste behavior
+- End-to-end workflow completion
+- Undo/redo (only if indicated in generated suite context)
+
+10. AUTOMATION FRIENDLY OUTPUT
+- Keep language objective and observable (UI state, data state, persistence state).
+- Output should be suitable for both manual and automation implementation.
+
+11. REQUIREMENT-CENTRIC VALIDATION
+- For every test case, ask: "Can I directly trace this test case to a requirement?"
+- If NO, remove the test case.
+- Do not invent the following unless explicitly mentioned in requirements:
+    - Offline scenarios
+    - Unsupported browser scenarios
+    - Performance scenarios
+    - Concurrency scenarios
+    - Stress scenarios
+
+12. EXPECTED RESULT COMPLETENESS
+    -Reject expected results that merely repeat the action.
+
+        Bad:
+
+        a. Image uploads successfully.
+
+        b. Link is created successfully.
+
+        Good:
+
+        a. Image is inserted into the editor.
+        b. Image is rendered correctly.
+        c. Image persists after save.
+        d. Image remains after page reload.
+
+        Good:
+
+        a. Hyperlink formatting is applied.
+        b. URL is associated with selected text.
+        c. Clicking the link opens the configured URL.
+        d. Link persists after save and reload.
+
+- For every expected result, verify it must answers:
+    - What UI changes?
+    - What data changes?
+    - What validation occurs?
+    - What persists after save/reload?
+
+    when applicable.
+
+- If expected results only restate the action, rewrite them.
+
+13. EXPECTED RESULT COVERAGE THRESHOLD
+- Every expected result MUST verify at least TWO of the following states:
+  - UI state (what is now visible, enabled, disabled, or changed on screen?)
+  - Data state (what was saved, updated, or deleted in the database?)
+  - Validation state (what error, warning, or success message appeared?)
+  - Persistence state (does the change survive a page reload or re-login?)
+  - Integration state (was an API called? was an external system updated?)
+- Expected results that verify only one state must be rewritten to include a second.
+
+====================================================
+SELF REVIEW
+====================================================
+Note: The SELF REVIEW score is an internal reasoning step only.
+Do NOT include scores or review commentary in the JSON output.
+Before final output, score the suite:
+- Duplicate Coverage Score (0-10)
+- Expected Result Quality Score (0-10)
+- Realism Score (0-10)
+- Traceability Score (0-10)
+- Automation Readiness Score (0-10)
+
+If any score is below 8, perform another internal review pass before returning final suite.
+
+====================================================
+OUTPUT FORMAT
+====================================================
+Return ONLY the final improved test suite as a valid JSON array.
+For every case include:
+- tc_id
+- title
+- preconditions
+- steps
+- expected_result (numbered lines)
+- priority
+- type
+- test_data
+- automation_status
+- roles_covered
+- coverage_refs
+
+Remove duplicate, unrealistic, unverifiable, and low-value test cases.
+Final output should resemble senior QA design-review quality."""
+
+    resp = client.chat.completions.create(
+        model=st.session_state.selected_model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+        max_tokens=4000,
+    )
+    raw = resp.choices[0].message.content.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw).strip()
+    cases = json.loads(raw)
+    return _resequence_case_ids(cases, feature_prefix)
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -878,7 +1972,11 @@ Review the generated test cases against the requirements brief.
 
 Return ONLY valid JSON — no markdown fences, no explanation:
 {{
-  "overall_score": 0.85,
+  "duplicate_score": 0.9,
+  "traceability_score": 0.8,
+  "expected_result_score": 0.6,
+  "realism_score": 0.9,
+  "overall_score": 0.8,
   "overall_reason": "One-sentence summary of coverage quality.",
   "case_scores": [
     {{
@@ -899,7 +1997,7 @@ Return ONLY valid JSON — no markdown fences, no explanation:
 }}"""
 
     resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
+        model=st.session_state.selected_model,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.1,
         max_tokens=2000,
@@ -919,6 +2017,7 @@ def generate_test_cases(
     str_list: tuple,
     comments: str,        # pre-fetched comment text ('' if disabled)
     cypress_context: str, # relevant Cypress patterns from RAG ('' if none)
+    product_knowledge_context: str,  # feature-scoped product docs context ('' if none)
     existing_tcs: tuple,
     selected_roles: tuple,
     feature_prefix: str,
@@ -977,6 +2076,13 @@ def generate_test_cases(
         f"\nExisting Cypress Automation Patterns (inform automation_status):\n{cypress_context[:600]}\n"
         if cypress_context.strip() else ""
     )
+    product_knowledge_section = (
+        f"\nFeature-Scoped Product Knowledge (same feature only):\n"
+        f"{product_knowledge_context[:1800]}\n"
+        if product_knowledge_context.strip() else
+        "\nFeature-Scoped Product Knowledge: none found for this feature. "
+        "Do not infer behavior from other features.\n"
+    )
     role_context_section = (
         f"\nRole Permission Context (use to write precise preconditions, scope negative role cases,\n"
         f"and decide whether a behaviour change per role is expected for this feature):\n{role_ctx}\n"
@@ -1021,6 +2127,7 @@ Steps to Reproduce (use as test execution steps):
 {comments_section}
 Background / Dev Notes (context only — not requirements):
 {_desc_clean}
+{product_knowledge_section}
 {role_context_section}{cypress_section}
 Existing TestRail Test Cases (do NOT duplicate):
 {existing_block}
@@ -1033,37 +2140,83 @@ COVERAGE MANDATE
 ══════════════════════════════════════════════════════
 There are {fr_count} functional requirements above ({item_tag}-01 … {item_tag}-{fr_count:02d}).
 
-STEP 1 — PER-{item_tag} CASES (one positive test case per functional requirement, in order):
-  Tag each title: "[{item_tag}-XX] <what is being verified>"
-  Only group items that are literally sequential sub-steps of one indivisible flow.
-  When in doubt — do NOT group.
+STEP 1 — SCENARIO-LEVEL POSITIVE CASES:
+    Generate business-scenario test cases, not one case per individual requirement or UI control.
+    A single positive case may cover multiple related requirements when they are validated in the same workflow,
+    screen area, or user interaction sequence.
+    Prefer grouping when setup, navigation, and pass/fail intent are shared.
+
+    MERGE these kinds of checks into one test case when they belong to the same scenario:
+    - Multiple related toolbar options or tooltips in the same toolbar walkthrough
+    - Multiple formatting actions validated in one formatting workflow
+    - Related UI presence, availability, state, and hover/tooltip checks on the same component
+    - Closely related validations that would otherwise repeat the same setup and steps
+
+    Example grouping:
+    - Bold tooltip + Italic tooltip + Underline tooltip -> one case: verify formatting toolbar options and tooltips
+    - Bold + Italic + Underline + Strikethrough formatting -> one case: verify formatting actions from the toolbar
+    - Toolbar visibility + option availability + tooltip placement -> one UI validation case
+
+    Keep separate test cases only when:
+    - Preconditions differ significantly
+    - Different business workflows are involved
+    - Failure reporting would become unclear if merged
+    - The functionality is independently automatable or operationally distinct
+
+    Usually keep these as separate scenarios when present:
+    - Link behavior
+    - Image upload behavior
+    - Date picker behavior
+    - Data persistence/save behavior
+    - Suspension/reactivation or major role-state transitions
+
+    Tag each title with the dominant coverage area, for example "[{item_tag}-01/{item_tag}-02] ..." when one case covers multiple requirements.
 
 STEP 2 — EDGE & BOUNDARY CASES:
   Cover all Edge Cases (EC-01…) using Boundary Value Analysis and Equivalence Partitioning.
   For any search, filter, or list feature ALWAYS include:
     - A case where the query/filter returns ZERO results (no-match / empty results state)
     - A case where the query returns exactly one result
-  Tag: "[EC-XX] <boundary or edge being tested>"
+    Group related edge validations when they belong to the same workflow and can be executed together without losing clarity.
+    Tag: "[EC-XX] <boundary or edge being tested>"
 
 STEP 3 — NEGATIVE CASES:
   Cover all Negative Scenarios (NS-01…) and Validation Rules.
   For search/filter features ALWAYS include a case for a valid query that matches nothing.
-  Tag: "[{item_tag}-XX – Negative] <what fails or is invalid>"
+    Merge closely related invalid-input checks into one negative scenario when they share the same form, dialog, or workflow.
+    Tag: "[{item_tag}-XX – Negative] <what fails or is invalid>"
 
 STEP 4 — SUPPLEMENTARY:
-  - At least one role-permission case each for contributor and consumer
-  - 1 error-handling / API failure case if API touch points exist
-  - 1 concurrent edit or reload edge case if relevant
+    - Role-permission cases only when explicitly required by story evidence.
+    - Do not add generic error/network/concurrency cases unless explicitly stated in story evidence.
 
-Expected output: {fr_count} to {fr_count * 2} test cases minimum.
-Do NOT stop until every {item_tag}-01 through {item_tag}-{fr_count:02d} AND every EC and NS is covered.
+QUALITY TARGET:
+    Group test cases ONLY when all of these hold:
+    - Same user workflow
+    - Same business objective
+    - Same pass/fail outcome
+    Do NOT merge unrelated validations simply to reduce test count.
+    Favor maintainability over minimizing number of test cases.
+    Minimise repeated setup steps while preserving clear pass/fail reporting.
+    Do NOT create separate cases only because different UI elements or tooltips are being checked.
+    Do NOT stop until every {item_tag}-01 through {item_tag}-{fr_count:02d} AND every EC and NS is covered by at least one case.
 ══════════════════════════════════════════════════════
+
+STRICT REALISM RULES:
+- Only generate test cases that are explicitly supported by this Jira story content (Requirements, AC, STR, comments, description).
+- If a scenario is not present in story evidence, do NOT create a test case for it.
+- Specifically forbidden unless explicitly mentioned in story evidence:
+    - Network/API failure, server errors, timeouts, offline behavior
+    - Concurrency/race-condition scenarios
+    - Performance/load/stress scenarios
+    - Unsupported-browser/cross-browser scenarios
+- If uncertain, add it as a QA gap/question rather than a test case.
 
 Return ONLY a valid JSON array — no markdown fences, no explanation:
 [
   {{
     "tc_id":             "{feature_prefix}-001",
-    "title":             "[{item_tag}-XX] [Action] [Object] verifies [Expected Outcome]",
+        "title":             "[{item_tag}-XX/{item_tag}-YY] [Scenario] verifies [Expected Outcome]",
     "priority":          "Critical|High|Medium|Low",
     "type":              "Functional|Regression|Smoke|Integration|Negative|Edge",
     "preconditions":     "Role required, existing data state, feature flags if any",
@@ -1071,7 +2224,8 @@ Return ONLY a valid JSON array — no markdown fences, no explanation:
     "expected_result":   "Observable, verifiable outcome after all steps",
     "test_data":         "CY_Test | specific values, or 'N/A'",
     "automation_status": "Automated|Manual|Candidate",
-    "roles_covered":     ["admin"]
+        "roles_covered":     ["admin"],
+        "coverage_refs":     ["{item_tag}-01", "{item_tag}-02", "EC-01"]
   }}
 ]
 
@@ -1080,11 +2234,24 @@ Rules:
 - Priority: Critical = core/data-loss, High = main flows, Medium = edge/negative cases, Low = cosmetic
 - automation_status: Candidate = stable repeatable, Manual = exploratory, Automated = maps to Cypress
 - Always prefix test data with "CY_Test |"
-- Role cases: at least one negative for contributor, one for consumer. Full role flows only when
-  the story explicitly names a role. Focus on access-control boundaries, not duplicating happy-path."""
+- coverage_refs must list every FR/SC/EC/NS/VR item materially covered by that test case
+- ROLE SCOPING RULE
+
+    Generate role-based test cases ONLY when:
+
+    1. Requirements explicitly mention roles.
+    2. Acceptance criteria differ by role.
+    3. Permissions affect feature visibility.
+    4. Access control is part of the story.
+
+    Otherwise:
+
+    Do not generate contributor, consumer, editor, or admin specific tests.
+
+    Use a single generic positive workflow."""
 
     resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
+        model=st.session_state.selected_model,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
         max_tokens=16000,
@@ -1093,9 +2260,29 @@ Rules:
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw).strip()
 
+    _story_evidence_text = "\n".join([
+        fr_block,
+        ec_block,
+        neg_block,
+        val_block,
+        api_block,
+        str_block,
+        comments or "",
+        _desc_clean,
+        product_knowledge_context or "",
+        cypress_context or "",
+    ])
+
     # Recover from truncated JSON — trim to last complete object
     try:
-        return json.loads(raw)
+        cases = json.loads(raw)
+        cases, dropped = _drop_unstated_scenarios(cases, _story_evidence_text)
+        if dropped:
+            st.warning(
+                f"⚠️ Removed {dropped} generated test case(s) not explicitly supported by Jira story evidence.",
+                icon="⚠️",
+            )
+        return cases
     except json.JSONDecodeError:
         last_close = raw.rfind("},")
         if last_close == -1:
@@ -1107,11 +2294,17 @@ Rules:
             trimmed += "]"
             try:
                 cases = json.loads(trimmed)
+                cases, dropped = _drop_unstated_scenarios(cases, _story_evidence_text)
                 st.warning(
                     f"⚠️ GPT response was truncated — recovered {len(cases)} of the generated "
                     "test cases. Consider re-generating or splitting into smaller stories.",
                     icon="⚠️",
                 )
+                if dropped:
+                    st.warning(
+                        f"⚠️ Removed {dropped} generated test case(s) not explicitly supported by Jira story evidence.",
+                        icon="⚠️",
+                    )
                 return cases
             except json.JSONDecodeError:
                 pass
@@ -1162,24 +2355,34 @@ def generate_bulk_test_cases(
         + (f"Existing Cypress Automation Patterns (use to inform automation_status):\n{cypress_context}\n\n" if cypress_context.strip() else "")
         + f"Roles to cover: {roles_block}\n"
         f"Feature prefix for TC IDs: {feature_prefix}\n\n"
-        "Generate a unified, deduplicated test suite covering ALL of the following:\n"
-        "1. Happy path for each acceptance criterion across all stories\n"
+        "Generate a unified, deduplicated, scenario-based test suite covering ALL of the following:\n"
+        "1. Happy-path business scenarios across all stories\n"
         "2. Cross-story integration flows (where story A creates something story B uses)\n"
-        "3. Negative / validation cases (invalid data, missing required fields, wrong format)\n"
+        "3. Negative / validation scenarios (invalid data, missing required fields, wrong format)\n"
         "4. Role-based access for the feature as a whole\n"
         "5. Edge cases: empty state, dependency deletion, concurrent edits, mid-flow reload\n"
         "6. Regression risk areas most likely to break if any story changes\n\n"
+        "SCENARIO GROUPING RULES:\n"
+        "- Group closely related UI checks into one test case when they share setup and workflow.\n"
+        "- Do not create separate cases only for individual toolbar buttons, tooltips, or nearby formatting controls.\n"
+        "- Keep separate cases only when workflows, preconditions, or failure reporting differ materially.\n"
+        "- Preserve traceability by listing all covered AC items in coverage_refs for each case.\n"
+        "- Target fewer, broader cases; for a medium feature, prefer roughly 10-15 strong cases over dozens of micro-cases.\n\n"
+        "STRICT REALISM RULES:\n"
+        "- Generate only scenarios explicitly supported by the provided stories (AC, STR, description, comments).\n"
+        "- Do NOT invent test cases for network/API failure, server errors, timeouts, offline behavior, concurrency/race conditions, performance/load, or browser-compatibility unless explicitly mentioned in the stories.\n"
+        "- If not explicitly described in stories, treat it as a QA question/gap, not a test case.\n\n"
         "AC TYPE CLASSIFICATION — apply this per-AC when deciding coverage:\n"
-        "  TYPE A (Explicit functional): AC describes exact UI action and measurable outcome → 1 positive + 1 negative\n"
-        "  TYPE B (Rule/constraint): AC describes a business rule, permission, or limit → 1 in-bounds + 1 boundary/limit test\n"
-        "  TYPE C (Non-functional): AC covers error messages, performance, UX, or display only → 1 positive (verify message/display)\n"
-        "You MUST produce at least one test case per AC item (AC-01 .. AC-N) across all stories listed.\n\n"
+        "  TYPE A (Explicit functional): AC describes exact UI action and measurable outcome → cover in one or more scenario cases\n"
+        "  TYPE B (Rule/constraint): AC describes a business rule, permission, or limit → cover via in-bounds + boundary/limit scenarios\n"
+        "  TYPE C (Non-functional): AC covers error messages, performance, UX, or display only → group with the nearest relevant user scenario when practical\n"
+        "You MUST ensure every AC item (AC-01 .. AC-N) is covered, but multiple AC items may map to the same scenario-based test case.\n\n"
         "Return ONLY a valid JSON array — no markdown fences, no explanation:\n"
         "[\n"
         "  {\n"
         f'    \"tc_id\":             \"{feature_prefix}-001\",\n'
         '    \"jira_ref\":          \"STUD-XXXX or General\",\n'
-        '    \"title\":             \"[Action] [Object] verifies [Expected Outcome]\",\n'
+        '    \"title\":             \"[Scenario] verifies [Expected Outcome]\",\n'
         '    \"priority\":          \"Critical|High|Medium|Low\",\n'
         '    \"type\":              \"Functional|Regression|Smoke|Integration|Negative\",\n'
         '    \"preconditions\":     \"Role required, existing data state, feature flags if any\",\n'
@@ -1187,7 +2390,8 @@ def generate_bulk_test_cases(
         '    \"expected_result\":   \"Observable, verifiable outcome after all steps\",\n'
         '    \"test_data\":         \"CY_Test | specific values, or N/A\",\n'
         '    \"automation_status\": \"Automated|Manual|Candidate\",\n'
-        '    \"roles_covered\":     [\"admin\"]\n'
+        '    \"roles_covered\":     [\"admin\"],\n'
+        '    \"coverage_refs\":     [\"AC-01\", \"AC-02\"]\n'
         "  }\n"
         "]\n\n"
         "Rules:\n"
@@ -1197,12 +2401,16 @@ def generate_bulk_test_cases(
         "- automation_status: \"Candidate\" for stable repeatable flows, \"Manual\" for exploratory, "
         "\"Automated\" for clear Cypress pattern matches\n"
         "- Always prefix test data with \"CY_Test |\"\n"
-        "- Minimum one negative case per acceptance criterion\n"
+        "- coverage_refs must list every AC / edge / negative item materially covered by that case\n"
+        "- Do not produce one-case-per-AC if multiple ACs belong to the same user scenario\n"
         "- Do NOT generate duplicate test cases across stories\n"
         "- ROLE SCOPING RULE:\n"
-        "  ALWAYS generate:\n"
-        "    - At least one negative case for contributor (cannot perform write/admin actions on this feature)\n"
-        "    - At least one negative case for consumer (cannot perform write/admin/editor actions on this feature)\n"
+        "  Generate role-based tests ONLY IF:\n"
+        "    - 1. Requirements mention permissions\n"
+        "    - 2. Story mentions roles\n"
+        "    - 3. Feature visibility differs by role\n"
+        "    - 4. Existing behavior varies by role\n\n"
+        "      Otherwise generate no role-specific tests.\n"
         "  Generate FULL additional role-specific flows ONLY when:\n"
         "    a) A story explicitly names a role (e.g. 'admin can...', 'editor should not...'), OR\n"
         "    b) The feature clearly behaves differently between the listed roles.\n"
@@ -1211,14 +2419,21 @@ def generate_bulk_test_cases(
     )
 
     resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
+        model=st.session_state.selected_model,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
     )
     raw = resp.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw).strip()
-    return json.loads(raw)
+    cases = json.loads(raw)
+    cases, dropped = _drop_unstated_scenarios(cases, stories_block)
+    if dropped:
+        st.warning(
+            f"⚠️ Removed {dropped} generated test case(s) not explicitly supported by Jira story evidence.",
+            icon="⚠️",
+        )
+    return cases
 
 
 # ── TestRail API ──────────────────────────────────────────────────────────────
@@ -1397,6 +2612,26 @@ def export_to_testrail(cases: list, suite_id: int, section_id: int) -> list:
 # ══════════════════════════════════════════════════════════════════════════════
 # UI
 # ══════════════════════════════════════════════════════════════════════════════
+
+# Initialize session state for model selection
+if "selected_model" not in st.session_state:
+    st.session_state.selected_model = OPENAI_MODEL
+if "show_export_confirm" not in st.session_state:
+    st.session_state.show_export_confirm = False
+if "pending_export" not in st.session_state:
+    st.session_state.pending_export = None
+
+# Sidebar model selector
+with st.sidebar:
+    st.subheader("⚙️ Settings")
+    st.session_state.selected_model = st.selectbox(
+        "Select LLM Model",
+        ["gpt-4o", "gpt-4-turbo"],
+        index=0 if st.session_state.selected_model != "gpt-4-turbo" else 1,
+        help="Choose which OpenAI model to use for test case generation",
+    )
+    st.divider()
+
 st.title("📝 Test Case Generator")
 st.caption("Generate structured manual test cases from Jira stories — export directly to TestRail")
 
@@ -1591,7 +2826,7 @@ if mode == "🔷 Feature Bulk (Multi-Story)":
             )
             with st.spinner(
                 f"Analysing {len(bulk_stories)} stories and generating unified "
-                f"test suite with {OPENAI_MODEL}…"
+                f"test suite with {st.session_state.selected_model}…"
             ):
                 try:
                     _bulk_cypress = get_cypress_patterns(
@@ -1601,6 +2836,26 @@ if mode == "🔷 Feature Bulk (Multi-Story)":
                         _stories_tuple, _ex_json, _bulk_cypress,
                         tuple(sorted(selected_roles)), feature_prefix,
                     )
+                    with st.spinner("Refining generated feature suite to remove overlap and tighten expected results…"):
+                        try:
+                            _bulk_refinement_brief = {
+                                "stories": [
+                                    {
+                                        "key": _d["key"],
+                                        "summary": _d["summary"],
+                                        "ac_list": _d.get("ac_list", []),
+                                        "str_list": _d.get("str_list", []),
+                                    }
+                                    for _d in _loaded_stories.values()
+                                ]
+                            }
+                            _cases = refine_generated_cases(
+                                json.dumps(_cases, sort_keys=True),
+                                json.dumps(_bulk_refinement_brief, sort_keys=True),
+                                feature_prefix,
+                            )
+                        except Exception as _refine_err:
+                            st.warning(f"Refinement step skipped: {_refine_err}")
                     st.session_state[sk_cases] = _cases
                     st.session_state[sk_sel]   = list(range(len(_cases)))
                 except Exception as _e:
@@ -1685,28 +2940,64 @@ if mode == "🔷 Feature Bulk (Multi-Story)":
                     _suite_id = st.number_input("Suite ID",   min_value=1, value=1, step=1, key="bulk_suite_id")
                     _sec_id   = st.number_input("Section ID", min_value=1, value=1, step=1, key="bulk_sec_id")
 
+                _bulk_pending_key = f"bulk_pending_export_{bulk_sig}"
                 _n_sel = len(_all_selected)
-                if st.button(
-                    f"📤 Export {_n_sel} Case(s) to TestRail",
-                    disabled=(_n_sel == 0),
-                    type="primary",
-                    key="bulk_export_btn",
-                ):
-                    _to_export = [_get_edited(_bulk_generated[_i], f"bulk_edit_{bulk_sig}_{_i}") for _i in _all_selected]
-                    with st.spinner(f"Exporting {len(_to_export)} test case(s)…"):
-                        _results = export_to_testrail(_to_export, int(_suite_id), int(_sec_id))
-                    _created = sum(1 for _r in _results if "✅" in _r["status"])
-                    _failed  = len(_results) - _created
-                    if _created:
-                        st.success(f"✅ {_created} test case(s) created in TestRail.")
-                    if _failed:
-                        st.error(f"❌ {_failed} test case(s) failed to export.")
-                    for _r in _results:
-                        _link = (
-                            f" → [C{_r['id']}]({TESTRAIL_URL}/index.php?/cases/view/{_r['id']})"
-                            if _r["id"] else ""
+                _col1, _col2 = st.columns([3, 1])
+                with _col1:
+                    _export_btn = st.button(
+                        f"📤 Export {_n_sel} Case(s) to TestRail",
+                        disabled=(_n_sel == 0),
+                        type="primary",
+                        key="bulk_export_btn",
+                        use_container_width=True,
+                    )
+                if _export_btn:
+                    st.session_state[_bulk_pending_key] = {
+                        "selected_indices": list(_all_selected),
+                        "suite_id": int(_suite_id),
+                        "section_id": int(_sec_id),
+                        "suite_label": _suite_label if _suites else f"Suite ID {_suite_id}",
+                        "section_label": _sec_label if _suites and _sections else f"Section ID {_sec_id}",
+                    }
+                    st.rerun()
+
+                _bulk_pending = st.session_state.get(_bulk_pending_key)
+                if _bulk_pending:
+                    with _col2:
+                        st.warning(
+                            f"⚠️ Export {len(_bulk_pending['selected_indices'])} case(s) to "
+                            f"{_bulk_pending['suite_label']} / {_bulk_pending['section_label']}?"
                         )
-                        st.markdown(f"{_r['status']} **{_r['title']}**{_link}")
+                    _col_confirm_yes, _col_confirm_no = st.columns(2)
+                    with _col_confirm_yes:
+                        if st.button("✅ Yes, Export", type="primary", use_container_width=True, key="bulk_confirm_yes"):
+                            _to_export = [
+                                _get_edited(_bulk_generated[_i], f"bulk_edit_{bulk_sig}_{_i}")
+                                for _i in _bulk_pending["selected_indices"]
+                            ]
+                            with st.spinner(f"Exporting {len(_to_export)} test case(s)…"):
+                                _results = export_to_testrail(
+                                    _to_export,
+                                    _bulk_pending["suite_id"],
+                                    _bulk_pending["section_id"],
+                                )
+                            st.session_state.pop(_bulk_pending_key, None)
+                            _created = sum(1 for _r in _results if "✅" in _r["status"])
+                            _failed  = len(_results) - _created
+                            if _created:
+                                st.success(f"✅ {_created} test case(s) created in TestRail.")
+                            if _failed:
+                                st.error(f"❌ {_failed} test case(s) failed to export.")
+                            for _r in _results:
+                                _link = (
+                                    f" → [C{_r['id']}]({TESTRAIL_URL}/index.php?/cases/view/{_r['id']})"
+                                    if _r["id"] else ""
+                                )
+                                st.markdown(f"{_r['status']} **{_r['title']}**{_link}")
+                    with _col_confirm_no:
+                        if st.button("❌ Cancel", use_container_width=True, key="bulk_confirm_no"):
+                            st.session_state.pop(_bulk_pending_key, None)
+                            st.info("Export cancelled.")
 
         elif sk_data in st.session_state:
             st.info("Stories loaded. Click **Generate Feature Test Suite** to generate test cases.")
@@ -1734,7 +3025,12 @@ cols[3].metric("TC Prefix",      feature_prefix)
 st.markdown(f"**📝 Summary:** {selected['summary']}")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["📄 Story Details & AC", "✅ Existing Test Cases", "🤖 Generate & Export"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📄 Story Details & AC",
+    "✅ Existing Test Cases",
+    "🤖 Generate & Export",
+    "💻 Generate Automation Code",
+])
 
 # ── Tab 1: Story Details ──────────────────────────────────────────────────────
 with tab1:
@@ -1796,6 +3092,10 @@ with tab1:
                 _role_ctx    = get_role_context(selected["summary"], feature_prefix)
                 _brief       = extract_requirements(_ticket_json, "", "", _role_ctx)
                 st.session_state[f"brief_{selected['key']}"] = _brief
+                st.session_state[f"story_feature_key_{selected['key']}"] = (
+                    (_brief or {}).get("feature_key")
+                    or (_ticket or {}).get("feature_key", "")
+                )
 
                 _qa_gaps = _brief.get("qa_gaps", [])
                 if _qa_gaps:
@@ -1891,6 +3191,8 @@ with tab2:
 with tab3:
     state_cases = f"gen_cases_{selected['key']}"
     state_sel   = f"sel_idx_{selected['key']}"
+    state_pk_chunks = f"product_ctx_chunks_{selected['key']}"
+    state_pk_feature = f"product_ctx_feature_{selected['key']}"
 
     if state_cases not in st.session_state:
         st.session_state[state_cases] = []
@@ -1904,6 +3206,17 @@ with tab3:
             st.session_state[state_cases] = []
             st.session_state[state_sel]   = []
 
+    _pk_chunks = st.session_state.get(state_pk_chunks, [])
+    _pk_feature = st.session_state.get(state_pk_feature, "")
+    if _pk_chunks:
+        with st.expander(
+            f"📚 Product Knowledge Chunks Used (feature: {_pk_feature or 'unknown'})",
+            expanded=False,
+        ):
+            for i, ch in enumerate(_pk_chunks, 1):
+                st.markdown(f"**{i}. {ch.get('path', 'unknown')}**")
+                st.code(ch.get("snippet", ""), language=None)
+
     if gen_clicked:
         content  = get_story_content(selected["key"], selected.get("content", ""))
         ac_list  = extract_acceptance_criteria(content)
@@ -1913,7 +3226,27 @@ with tab3:
         comments  = _live_cmt or (extract_comments(content) if include_comments else "")
         ex_tcs      = get_existing_test_cases(selected["key"], selected["summary"])
         cypress_ctx = get_cypress_patterns(selected["summary"])
-        with st.spinner(f"Step 2/3: Generating test cases with {OPENAI_MODEL}…"):
+        _story_feature_key = st.session_state.get(f"story_feature_key_{selected['key']}", "")
+        _pk_extra = "\n".join([
+            selected.get("summary", ""),
+            desc or "",
+            " ".join(ac_list[:8]),
+            " ".join(str_list[:8]),
+            comments[:600],
+        ])
+        _pk_bundle = get_product_knowledge_chunks(
+            selected["summary"],
+            feature_prefix,
+            _pk_extra,
+            forced_feature_key=_story_feature_key,
+        )
+        st.session_state[state_pk_chunks] = _pk_bundle.get("chunks", [])
+        st.session_state[state_pk_feature] = _pk_bundle.get("feature_key", "")
+        product_ctx = "\n\n".join(
+            f"[{s.get('path', 'unknown')}]\n{s.get('snippet', '')}"
+            for s in _pk_bundle.get("chunks", [])
+        )
+        with st.spinner(f"Step 2/3: Generating test cases with {st.session_state.selected_model}…"):
             try:
                 cases = generate_test_cases(
                     selected["key"], selected["summary"],
@@ -1921,9 +3254,24 @@ with tab3:
                     tuple(ac_list), tuple(str_list),
                     comments,
                     cypress_ctx,
+                    product_ctx,
                     tuple(json.dumps(t, sort_keys=True) for t in ex_tcs),
                     tuple(sorted(selected_roles)), feature_prefix,
                 )
+                with st.spinner("Step 3/4: Consolidating overlapping cases and tightening expected results…"):
+                    try:
+                        _brief_for_refinement = st.session_state.get(
+                            f"brief_{selected['key']}",
+                            {},
+                        )
+
+                        cases = refine_generated_cases(
+                            json.dumps(cases, sort_keys=True),
+                            json.dumps(_brief_for_refinement, sort_keys=True),
+                            feature_prefix,
+                        )
+                    except Exception as _refine_err:
+                        st.warning(f"Refinement step skipped: {_refine_err}")
                 # P3-fix: flag near-duplicate titles within this generation run
                 # so the user can deselect before export (token overlap ≥ 70%)
                 def _title_tokens(t: str) -> set:
@@ -1953,7 +3301,7 @@ with tab3:
                         icon="⚠️",
                     )
 
-                # ── Step 3: Self-critique pass ────────────────────────────
+                # ── Step 4: Self-critique pass ────────────────────────────
                 with st.spinner("🔍 Running self-critique and scoring confidence…"):
                     try:
                         _brief_for_critique = st.session_state.get(f"brief_{selected['key']}", {})
@@ -1961,7 +3309,54 @@ with tab3:
                             json.dumps(cases, sort_keys=True),
                             json.dumps(_brief_for_critique, sort_keys=True),
                         )
+                        _dim_scores = {
+                            k: float(_critique.get(k, 1) or 1)
+                            for k in ("duplicate_score", "traceability_score",
+                                      "expected_result_score", "realism_score")
+                        }
+                        _needs_second_pass = (
+                            float(_critique.get("overall_score", 0) or 0) < 0.85
+                            or any(v < 0.8 for v in _dim_scores.values())
+                            or bool(_critique.get("missing_coverage"))
+                            or bool(_critique.get("duplicate_pairs"))
+                            or bool(_critique.get("improvement_suggestions"))
+                        )
+
+                        if _needs_second_pass:
+                            with st.spinner("Step 4/4: Applying critique-driven refinement pass…"):
+                                cases = refine_generated_cases(
+                                    json.dumps(cases, sort_keys=True),
+                                    json.dumps(_brief_for_critique, sort_keys=True),
+                                    feature_prefix,
+                                    json.dumps(_critique, sort_keys=True),
+                                )
+                            _critique = critique_test_cases(
+                                json.dumps(cases, sort_keys=True),
+                                json.dumps(_brief_for_critique, sort_keys=True),
+                            )
+
                         st.session_state[f"critique_{selected['key']}"] = _critique
+
+                        # Recompute near-duplicates after critique-driven refinement.
+                        dup_indices = set()
+                        for a in range(len(cases)):
+                            if a in dup_indices:
+                                continue
+                            for b in range(a + 1, len(cases)):
+                                if b in dup_indices:
+                                    continue
+                                ta = _title_tokens(cases[a].get("title", ""))
+                                tb = _title_tokens(cases[b].get("title", ""))
+                                if ta and tb:
+                                    overlap = len(ta & tb) / max(len(ta), len(tb))
+                                    if overlap >= 0.70:
+                                        dup_indices.add(b)
+                                        cases[b]["_duplicate_of"] = cases[a].get("tc_id", str(a))
+
+                        st.session_state[state_sel] = [
+                            i for i in range(len(cases)) if i not in dup_indices
+                        ]
+
                         # Attach per-case scores back onto the case dicts
                         _score_map = {
                             s["tc_id"]: s
@@ -2089,27 +3484,264 @@ with tab3:
                 suite_id   = st.number_input("Suite ID",   min_value=1, value=1, step=1)
                 section_id = st.number_input("Section ID", min_value=1, value=1, step=1)
 
+            pending_export_key = f"pending_export_{selected['key']}"
             n_selected = len(selected_indices)
-            if st.button(
-                f"📤 Export {n_selected} Case(s) to TestRail",
-                disabled=(n_selected == 0),
-                type="primary",
-            ):
-                cases_to_export = [_get_edited(generated[i], f"edit_{selected['key']}_{i}") for i in selected_indices]
-                with st.spinner(f"Exporting {len(cases_to_export)} test case(s)…"):
-                    results = export_to_testrail(cases_to_export, int(suite_id), int(section_id))
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                export_btn = st.button(
+                    f"📤 Export {n_selected} Case(s) to TestRail",
+                    disabled=(n_selected == 0),
+                    type="primary",
+                    use_container_width=True,
+                )
+            if export_btn:
+                st.session_state[pending_export_key] = {
+                    "selected_indices": list(selected_indices),
+                    "suite_id": int(suite_id),
+                    "section_id": int(section_id),
+                    "suite_label": suite_label if suites else f"Suite ID {suite_id}",
+                    "section_label": section_label if suites and sections else f"Section ID {section_id}",
+                }
+                st.rerun()
 
-                created = sum(1 for r in results if "✅" in r["status"])
-                failed  = len(results) - created
-                if created:
-                    st.success(f"✅ {created} test case(s) created in TestRail.")
-                if failed:
-                    st.error(f"❌ {failed} test case(s) failed to export.")
-                for r in results:
-                    link = (
-                        f" → [C{r['id']}]({TESTRAIL_URL}/index.php?/cases/view/{r['id']})"
-                        if r["id"] else ""
+            pending_export = st.session_state.get(pending_export_key)
+            if pending_export:
+                with col2:
+                    st.warning(
+                        f"⚠️ Export {len(pending_export['selected_indices'])} case(s) to "
+                        f"{pending_export['suite_label']} / {pending_export['section_label']}?"
                     )
-                    st.markdown(f"{r['status']} **{r['title']}**{link}")
+                col_confirm_yes, col_confirm_no = st.columns(2)
+                with col_confirm_yes:
+                    if st.button("✅ Yes, Export", type="primary", use_container_width=True):
+                        cases_to_export = [
+                            _get_edited(generated[i], f"edit_{selected['key']}_{i}")
+                            for i in pending_export["selected_indices"]
+                        ]
+                        with st.spinner(f"Exporting {len(cases_to_export)} test case(s)…"):
+                            results = export_to_testrail(
+                                cases_to_export,
+                                pending_export["suite_id"],
+                                pending_export["section_id"],
+                            )
+                        st.session_state.pop(pending_export_key, None)
+
+                        created = sum(1 for r in results if "✅" in r["status"])
+                        failed  = len(results) - created
+                        if created:
+                            st.success(f"✅ {created} test case(s) created in TestRail.")
+                        if failed:
+                            st.error(f"❌ {failed} test case(s) failed to export.")
+                        for r in results:
+                            link = (
+                                f" → [C{r['id']}]({TESTRAIL_URL}/index.php?/cases/view/{r['id']})"
+                                if r["id"] else ""
+                            )
+                            st.markdown(f"{r['status']} **{r['title']}**{link}")
+                with col_confirm_no:
+                    if st.button("❌ Cancel", use_container_width=True):
+                        st.session_state.pop(pending_export_key, None)
+                        st.info("Export cancelled.")
     else:
         st.info("Click **Generate Test Cases** to analyse coverage gaps and generate structured test cases for this story.")
+
+
+# ── Tab 4: Generate Automation Code ─────────────────────────────────────────
+with tab4:
+    st.subheader("💻 Generate Automation Code")
+    st.caption(
+        "Generate Cypress automation artifacts from selected generated test cases. "
+        "Output is grounded in RAG context and automation guidelines."
+    )
+
+    state_cases = f"gen_cases_{selected['key']}"
+    state_auto_sel = f"auto_sel_idx_{selected['key']}"
+    state_auto_out = f"auto_codegen_{selected['key']}"
+    state_auto_feature_chunks = f"auto_feature_ctx_chunks_{selected['key']}"
+    state_auto_feature_key = f"auto_feature_key_{selected['key']}"
+    generated = st.session_state.get(state_cases, [])
+
+    if state_auto_sel not in st.session_state:
+        st.session_state[state_auto_sel] = []
+    if state_auto_out not in st.session_state:
+        st.session_state[state_auto_out] = {}
+
+    if not generated:
+        st.info("Generate test cases in the Generate & Export tab first, then select cases here for automation code generation.")
+    else:
+        st.markdown("**Select generated test cases as automation input:**")
+
+        selected_auto_indices = []
+        for i, tc in enumerate(generated):
+            _label = (
+                f"[{tc.get('tc_id', f'{feature_prefix}-{i+1:03d}')}] "
+                f"{tc.get('title', '')}"
+            )
+            checked = st.checkbox(
+                _label,
+                value=(i in st.session_state[state_auto_sel]),
+                key=f"auto_chk_{selected['key']}_{i}",
+            )
+            if checked:
+                selected_auto_indices.append(i)
+
+        st.session_state[state_auto_sel] = selected_auto_indices
+
+        col_gen, col_clear = st.columns([3, 1])
+        with col_gen:
+            auto_gen_clicked = st.button(
+                f"💻 Generate Automation Code ({len(selected_auto_indices)} selected)",
+                type="primary",
+                disabled=(len(selected_auto_indices) == 0),
+                use_container_width=True,
+            )
+        with col_clear:
+            if st.button("🗑️ Clear Output", use_container_width=True):
+                st.session_state[state_auto_out] = {}
+
+        _af_chunks = st.session_state.get(state_auto_feature_chunks, [])
+        _af_key = st.session_state.get(state_auto_feature_key, "")
+        if _af_chunks:
+            with st.expander(
+                f"📚 Automation Feature Context Chunks Used (feature: {_af_key or 'unknown'})",
+                expanded=False,
+            ):
+                for i, ch in enumerate(_af_chunks, 1):
+                    st.markdown(f"**{i}. {ch.get('path', 'unknown')}**")
+                    st.code(ch.get("snippet", ""), language=None)
+        else:
+            st.caption("ℹ️ No feature-context chunks found for this run yet.")
+
+        if auto_gen_clicked:
+            selected_cases = [
+                _get_edited(generated[i], f"edit_{selected['key']}_{i}")
+                for i in selected_auto_indices
+            ]
+            selected_cases_json = json.dumps(selected_cases, sort_keys=True)
+            case_titles = tuple(tc.get("title", "") for tc in selected_cases if tc.get("title"))
+            _case_context_text = "\n".join(
+                f"title={tc.get('title', '')}; pre={tc.get('preconditions', '')}; "
+                f"steps={tc.get('steps', '')}; expected={tc.get('expected_result', '')}"
+                for tc in selected_cases
+            )
+            _story_feature_key = st.session_state.get(f"story_feature_key_{selected['key']}", "")
+
+            with st.spinner("Loading automation guidelines and RAG framework context…"):
+                guidelines = load_automation_guidelines()
+                automation_context = get_automation_context(
+                    selected["summary"],
+                    case_titles,
+                    feature_prefix,
+                    _case_context_text,
+                    forced_feature_key=_story_feature_key,
+                )
+                st.session_state[state_auto_feature_chunks] = automation_context.get("feature_context", [])
+                st.session_state[state_auto_feature_key] = automation_context.get("feature_key", "")
+
+            if not guidelines:
+                st.error("Could not load automation guidelines. Ensure rag/docs/automation/automation-guidelines.md exists.")
+            else:
+                with st.spinner(f"Generating Cypress artifacts with {st.session_state.selected_model}…"):
+                    try:
+                        auto_payload = generate_automation_code(
+                            selected["key"],
+                            selected["summary"],
+                            feature_prefix,
+                            selected_cases_json,
+                            json.dumps(automation_context, sort_keys=True),
+                            guidelines,
+                        )
+                        auto_payload["_meta"] = {
+                            "selected_case_count": len(selected_cases),
+                            "selected_case_ids": [
+                                tc.get("tc_id", "") for tc in selected_cases
+                            ],
+                        }
+                        st.session_state[state_auto_out] = auto_payload
+                    except Exception as e:
+                        st.error(f"Automation code generation failed: {e}")
+
+        auto_out = st.session_state.get(state_auto_out, {})
+        if auto_out:
+            spec_file = auto_out.get("spec_file", {}) or {}
+            po_updates = auto_out.get("page_object_updates", []) or []
+            cmd_suggestions = auto_out.get("command_suggestions", []) or []
+            grounding = auto_out.get("grounding_evidence", []) or []
+            fc_applied = auto_out.get("feature_context_application", []) or []
+            spec_style = auto_out.get("similar_spec_style_guide", {}) or {}
+
+            st.divider()
+            with st.expander("🧭 Similar Spec Style Guide Used", expanded=False):
+                _rules = spec_style.get("style_rules", []) or []
+                _reuse = spec_style.get("must_reuse_patterns", []) or []
+                _cautions = spec_style.get("cautions", []) or []
+                if _rules:
+                    st.markdown("**Style Rules**")
+                    for r in _rules:
+                        st.markdown(f"- {r}")
+                if _reuse:
+                    st.markdown("**Must-Reuse Patterns**")
+                    for p in _reuse:
+                        st.markdown(f"- {p}")
+                if _cautions:
+                    st.markdown("**Cautions**")
+                    for c in _cautions:
+                        st.markdown(f"- {c}")
+                if not (_rules or _reuse or _cautions):
+                    st.caption("No style guide extracted from similar specs for this run.")
+
+            st.divider()
+            st.markdown("**Generated Spec File**")
+            _spec_path = spec_file.get("path", "cypress/e2e/generated/generated.spec.cy.js")
+            _spec_content = spec_file.get("content", "")
+            st.text_input("Spec Path", value=_spec_path, key=f"auto_spec_path_{selected['key']}")
+            st.code(_spec_content or "", language="javascript")
+            st.download_button(
+                "⬇️ Download Spec",
+                data=_spec_content or "",
+                file_name=os.path.basename(_spec_path) or "generated.spec.cy.js",
+                mime="text/plain",
+                use_container_width=True,
+            )
+
+            st.divider()
+            st.markdown("**Page Object Updates**")
+            if po_updates:
+                for i, upd in enumerate(po_updates, 1):
+                    with st.expander(f"{i}. {upd.get('path', 'Page Object')}", expanded=False):
+                        st.caption(upd.get("summary", ""))
+                        st.code(upd.get("patch", ""), language="diff")
+            else:
+                st.caption("No page object updates suggested.")
+
+            st.divider()
+            st.markdown("**Custom Command Suggestions**")
+            if cmd_suggestions:
+                for i, cmd in enumerate(cmd_suggestions, 1):
+                    with st.expander(f"{i}. cy.{cmd.get('command', 'newCommand')}", expanded=False):
+                        st.caption(cmd.get("rationale", ""))
+                        st.code(cmd.get("sample", ""), language="javascript")
+            else:
+                st.caption("No custom command additions suggested.")
+
+            if grounding:
+                st.divider()
+                with st.expander("🔎 Grounding Evidence", expanded=False):
+                    for item in grounding:
+                        st.markdown(
+                            f"- **{item.get('artifact', 'artifact')}** from `{item.get('source_path', 'unknown')}`: "
+                            f"{item.get('reason', '')}"
+                        )
+
+            st.divider()
+            st.markdown("**📚 Feature Context Utilization Review**")
+            if fc_applied:
+                for i, item in enumerate(fc_applied, 1):
+                    st.markdown(
+                        f"{i}. **{item.get('context_item', 'Context item')}**\n"
+                        f"   - Applied In: {item.get('applied_in', 'N/A')}\n"
+                        f"   - Note: {item.get('note', '')}"
+                    )
+            else:
+                st.caption("No feature-context utilization mapping returned.")
+

@@ -22,6 +22,22 @@ env/
 rag/ingest_log.txt
 custom-agent/reports/
 
+# ── Local or product-specific data; do not publish ───────────────────────────
+/recovered-chat-sessions/
+/.playwright-mcp/
+/rag/docs/product_knowledge/
+/rag/docs/automation/automation-guidelines.md
+/rag/docs/automation/feature-context/
+/rag/pdfs/*.pdf
+/rag/faiss_index/index.faiss
+/rag/faiss_index/index.pkl
+/rag/faiss_index/metadata.json
+/*.xml
+/*.pptx
+/*.docx
+/.github/skills/cypress-notes-automation/
+/.github/skills/cypress-archive-content-type-automation/
+
 # ── OS noise ─────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
