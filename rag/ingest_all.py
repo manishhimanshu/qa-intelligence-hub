@@ -109,15 +109,24 @@ def run_ingestion(sources: list[str] = None) -> bool:
 
     # ── 6. Automation repository patterns ────────────────────────────────────
     if "automation" in all_sources:
-        automation_root = os.getenv("AUTOMATION_REPO_ROOT", "C:/Users/mhimanshu/Documents/ph")
-        print(f"\n[6/6] Ingesting automation repository from {automation_root}...")
-        try:
-            auto_docs = ingest_automation_repo(automation_root)
-            print(f"      ✓ {len(auto_docs)} automation knowledge chunks ingested.")
-            all_docs.extend(auto_docs)
-        except Exception as e:
-            print(f"      ✗ Automation ingestion failed: {e}")
+        automation_root = (os.getenv("AUTOMATION_REPO_ROOT") or "").strip()
+        if not automation_root:
+            print(
+                "\n[6/6] Skipping automation repository ingestion: "
+                "set AUTOMATION_REPO_ROOT in rag/.env to enable Cypress automation context."
+            )
+        elif not os.path.isdir(automation_root):
+            print(f"\n[6/6] Automation repository does not exist: {automation_root}")
             failed_sources.append("automation")
+        else:
+            print(f"\n[6/6] Ingesting automation repository from {automation_root}...")
+            try:
+                auto_docs = ingest_automation_repo(automation_root)
+                print(f"      ✓ {len(auto_docs)} automation knowledge chunks ingested.")
+                all_docs.extend(auto_docs)
+            except Exception as e:
+                print(f"      ✗ Automation ingestion failed: {e}")
+                failed_sources.append("automation")
 
     # ── Build / update vectorstore ────────────────────────────────────────────
     if rebuild and failed_sources:

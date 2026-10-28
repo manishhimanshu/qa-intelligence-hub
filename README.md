@@ -1,112 +1,138 @@
 # QA Intelligence Hub
 
-An internal AI-powered tool that automates test case generation, coverage analysis, and requirement gap analysis for the Kapost platform.
+One repository provides two QA tools that share configuration and a knowledge base:
 
-> **Full documentation:** [QA_Intelligence_Hub_Documentation.md](QA_Intelligence_Hub_Documentation.md)
+| Tool | Purpose | Entry point |
+|---|---|---|
+| Streamlit Hub | Manual test-case generation, coverage dashboard, and Jira gap analysis | `custom-agent-ui/app.py` |
+| QA Copilot | Jira/TestRail analysis and test generation, plus grounded Cypress automation through GitHub Copilot | `.github/agents/qa-analyst.agent.md` |
 
----
+## How the Tools Fit Together
 
-## What It Does
+```text
+                         Jira and TestRail
+                                |
+                       rag/ingest_all.py
+                                |
+                  rag/faiss_index + rag/docs
+                       /                \
+          Streamlit Hub                QA Copilot
+       OpenAI for generation     GitHub Copilot + qa-hub MCP
+```
 
-| Page | Purpose |
-|---|---|
-| 📝 **Test Case Generator** | Select any Jira story → AI generates structured test cases from AC → export to TestRail in one click |
-| 📊 **Coverage Dashboard** | Full Jira ↔ TestRail traceability matrix across all stories — filterable, exportable to Excel |
-| 🔍 **Gap Analysis** | AI-driven requirement gap analysis for any story or epic — identifies missing scenarios, generates PO questions |
+Both tools read the same `rag/.env`, `rag/faiss_index`, and `rag/docs`. The Streamlit app uses OpenAI for generation. The Copilot tool delegates reasoning and generation to your signed-in GitHub Copilot session; it does not need an OpenAI API key. The tools have separate user interfaces and entry points. Their Python retrieval code is not yet a shared library, so changes to one implementation do not automatically change the other.
 
----
+## First-Time Setup on Windows
 
-## Tech Stack
+### Prerequisites
 
-- **Frontend:** Streamlit (Python)
-- **LLM:** OpenAI GPT-4o (test case generation + gap analysis)
-- **Vector Search:** FAISS + HuggingFace `all-MiniLM-L6-v2` (local embeddings)
-- **Integrations:** Jira REST API v3, TestRail REST API v2
+- Git and Git LFS
+- Python 3.12 or later (64-bit)
+- Jira and TestRail credentials for the services you plan to use
+- An OpenAI API key for Streamlit test generation and gap analysis
+- For QA Copilot only: GitHub Copilot CLI, signed-in Copilot access, and Node.js 22 or later
 
----
+### 1. Clone and retrieve the knowledge index
 
-## Local Setup
+```powershell
+git clone <repository-url>
+Set-Location qa-intelligence-hub
+git lfs pull
+```
 
-**Prerequisites:** Python 3.12, Git LFS installed
+The FAISS index is stored with Git LFS. If `git lfs pull` is skipped, the tools may start without a usable knowledge index.
+
+### 2. Install the project dependencies
+
+From the repository root, run:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+.\setup.ps1
+```
+
+This creates `.venv`, installs the dependencies for both tools from the single root `requirements.txt`, and creates `rag/.env` from the template if it does not already exist. It never replaces an existing `rag/.env`.
+
+### 3. Configure credentials
+
+Open `rag/.env` and fill in the credentials needed for your workflows. The file is local and must not be committed.
+
+- Streamlit test generation and gap analysis need `OPENAI_API_KEY` and Jira settings.
+- TestRail-backed workflows need the TestRail URL, user, token, and project ID.
+- Jira ingestion needs `JIRA_PROJECT` as well as Jira credentials.
+- QA Copilot does not need `OPENAI_API_KEY`.
+- `AUTOMATION_REPO_ROOT` is optional for general Jira analysis. Set it to the absolute path of your Cypress repository to ingest Cypress code and enable repository-grounded automation generation.
+
+### 4. Start the Streamlit Hub
+
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run .\custom-agent-ui\app.py
+```
+
+Open the local URL printed by Streamlit, normally `http://localhost:8501`.
+
+### 5. Optional: enable QA Copilot
+
+Install and sign in to [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli), and make sure Node.js 22+ is available. Then, from the repository root, register the QA agent and MCP servers:
+
+```powershell
+.\qa-copilot-cli\setup.ps1
+copilot --agent=qa-analyst
+```
+
+The registration script configures `qa-hub` and the isolated Playwright MCP server for Copilot CLI and VS Code. In the agent, start with `Check setup`. Restart the Copilot session after changing MCP configuration. The default Playwright allowlist includes the QA app hosts and their required asset/CDN origins; set `PLAYWRIGHT_ALLOWED_ORIGINS` before running the registration script to override it.
+
+## macOS and Linux
+
+The shared Python environment can be installed manually from the repository root:
 
 ```bash
-# Clone
-git clone https://github.com/manishhimanshu/qa-intelligence-hub.git
-cd qa-intelligence-hub
-
-# Install dependencies
-python -m venv .venv
-.venv\Scripts\activate          # Windows
-pip install -r requirements.txt
-pip install -r custom-agent-ui/requirements.txt
-
-# Configure credentials
-cp rag/.env.example rag/.env    # then fill in your keys
-
-# Run
-.venv\Scripts\streamlit.exe run custom-agent-ui/app.py
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+cp rag/.env.example rag/.env
 ```
 
-Open `http://localhost:8501` in your browser.
-
----
-
-## Environment Variables
-
-Create `rag/.env` with the following:
-
-```env
-OPENAI_API_KEY=...
-OPENAI_MODEL=gpt-4o
-JIRA_URL=https://your-instance.atlassian.net
-JIRA_USER=your@email.com
-JIRA_TOKEN=...
-JIRA_PROJECT=STUD
-TESTRAIL_URL=https://your-instance.testrail.com
-TESTRAIL_USER=your@email.com
-TESTRAIL_TOKEN=...
-TESTRAIL_PROJECT_ID=34
-```
-
----
-
-## Refreshing the Knowledge Base (RAG Index)
-
-Run locally when you want to pick up new Jira stories or TestRail cases:
+Fill in `rag/.env`, then run:
 
 ```bash
-$env:PYTHONIOENCODING="utf-8"
-cd rag
-..\.venv\Scripts\python.exe ingest_all.py
+python -m streamlit run custom-agent-ui/app.py
 ```
 
-Then commit and push the updated index:
+The Copilot MCP registration helper is currently a PowerShell script for Windows. On other platforms, configure the local MCP servers using the paths and commands described in `qa-copilot-cli/setup.ps1`.
 
-```bash
-git add rag/faiss_index/
-git commit -m "Refresh RAG index - YYYY-MM-DD"
-git push
+## Refresh the Knowledge Base
+
+The checked-in Git LFS index is sufficient for normal use. Rebuild it only when the indexed Jira, TestRail, documentation, or Cypress data needs refreshing. Configure `rag/.env` first. For Cypress chunks, set `AUTOMATION_REPO_ROOT` to a valid Cypress repository path.
+
+Windows PowerShell:
+
+```powershell
+Push-Location .\rag
+$env:PYTHONIOENCODING = "utf-8"
+..\.venv\Scripts\python.exe .\ingest_all.py
+Pop-Location
 ```
 
-> Recommended cadence: after each sprint.
+To rebuild only selected sources, pass source names such as `jira`, `testrail`, `docs`, `pdf`, or `automation` after `ingest_all.py`. If `AUTOMATION_REPO_ROOT` is not set, automation ingestion is skipped with a warning; the rest of the index can still be rebuilt.
 
----
+## Tests
 
-## Project Structure
-
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s qa-copilot-cli/tests -p test_core.py
 ```
-custom-agent-ui/
-  app.py                      ← Streamlit app entry point
-  shared_vectorstore.py       ← Shared FAISS loader (singleton)
-  pages/
-    1_Test_Case_Generator.py
-    2_Coverage_Dashboard.py
-    3_Gap_Analysis.py
-rag/
-  ingest_all.py               ← Rebuild the RAG index
-  vectorstore.py              ← FAISS build/load
-  get_relevant_docs.py        ← Similarity search
-  faiss_index/                ← Binary index (Git LFS)
-  ingest/                     ← Per-source ingest modules
-requirements.txt
+
+## Repository Layout
+
+```text
+custom-agent-ui/       Streamlit application and pages
+qa-copilot-cli/        QA MCP server, Copilot integration, and tests
+rag/                   Shared ingestion code, docs, config, and FAISS index
+.github/agents/        QA analyst agent instructions
+.github/skills/        Reusable Jira, test design, review, and Cypress workflows
+requirements.txt       The only supported Python dependency manifest
+setup.ps1              Windows first-time Python environment setup
 ```
+
+`custom-agent/` contains an older prototype and is not one of the two supported tools. Use this README as the installation source of truth; `qa-copilot-cli/README.md` is only a short CLI reference.

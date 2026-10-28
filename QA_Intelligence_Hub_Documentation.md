@@ -1,5 +1,7 @@
 # QA Intelligence Hub
 
+> Current installation steps and the supported two-tool architecture are maintained in the root [README](README.md). This older detailed reference may describe behavior that has since changed; do not use it as the setup guide.
+
 **By Manish Himanshu**
 
 ---

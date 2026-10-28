@@ -9,7 +9,7 @@ $server   = Join-Path $cliRoot "mcp_server.py"
 $agentSrc = Join-Path $repoRoot ".github\agents\qa-analyst.agent.md"
 $skillsDir = Join-Path $repoRoot ".github\skills"
 
-if (-not (Test-Path $python)) { throw "Python venv not found at $python. Create .venv first." }
+if (-not (Test-Path $python)) { throw "Python venv not found at $python. Run .\setup.ps1 from the repository root first." }
 if (-not (Test-Path $agentSrc)) { throw "QA analyst agent not found at $agentSrc." }
 $nodeCandidates = @()
 if (Get-Command node -ErrorAction SilentlyContinue) {
@@ -37,16 +37,12 @@ if (-not $compatibleNode) { throw "Playwright MCP requires Node.js 22 or later. 
 $nodeHome = Split-Path $compatibleNode -Parent
 $npxCli = Join-Path $nodeHome "node_modules\npm\bin\npx-cli.js"
 if (-not (Test-Path $npxCli)) { throw "npm's npx-cli.js was not found under $nodeHome." }
-$allowedOrigins = if ($env:PLAYWRIGHT_ALLOWED_ORIGINS) { $env:PLAYWRIGHT_ALLOWED_ORIGINS } else { "https://e2etest.pilyr.com;https://arontier.pilyr.com" }
+$allowedOrigins = if ($env:PLAYWRIGHT_ALLOWED_ORIGINS) { $env:PLAYWRIGHT_ALLOWED_ORIGINS } else { "https://e2etest.pilyr.com;https://arontier.pilyr.com;https://assets.pilyr.com;https://cdn.jsdelivr.net;https://cdnjs.cloudflare.com" }
 foreach ($skill in @("jira-analysis", "manual-test-design", "test-case-generation", "test-case-review", "duplicate-test-detection", "cypress-automation-generation", "cypress-notes-automation", "cypress-archive-content-type-automation")) {
     if (-not (Test-Path (Join-Path $skillsDir "$skill\SKILL.md"))) {
         throw "Required Copilot skill '$skill' is missing from $skillsDir."
     }
 }
-
-Write-Host "Installing Python dependencies..."
-& $python -m pip install --quiet --disable-pip-version-check -r (Join-Path $cliRoot "requirements.txt")
-if ($LASTEXITCODE -ne 0) { throw "pip install failed." }
 
 $copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $HOME ".copilot" }
 $agentDir = Join-Path $copilotHome "agents"
