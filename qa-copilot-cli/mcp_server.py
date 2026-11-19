@@ -2,15 +2,19 @@
 
 Copilot's model does the analysis and generation; stdout is reserved for MCP transport.
 """
+import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import uuid
 from collections import OrderedDict
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
+
+from pydantic import ValidationError
 
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
@@ -29,7 +33,8 @@ from core.automation import (  # noqa: E402
     save_cypress_preview as _save_cypress_preview,
     _sanitize_source,
 )
-from core import config, jira_client, retrieval  # noqa: E402
+from core import config, jira_client, retrieval, testrail_client  # noqa: E402
+from core.feature_resolver import canonical_feature_key, load_feature_aliases  # noqa: E402
 from core.markdown import render_gap_analysis, render_test_cases  # noqa: E402
 from core.schemas import (  # noqa: E402
     GAP_SECTIONS,
@@ -50,7 +55,10 @@ mcp = FastMCP("qa-intelligence-hub")
 
 _context_cache: dict[str, dict] = {}
 _story_context_cache: OrderedDict[str, dict] = OrderedDict()
+_story_context_payloads: dict[str, str] = {}
 _STORY_CONTEXT_CACHE_LIMIT = 8
+_STORY_CONTEXT_INLINE_BYTES = 8000
+_STORY_CONTEXT_TEXT_PAGE_SIZE = 3000
 _STORY_CONTEXT_FOLLOWUP_LIMIT = 2
 _STORY_CONTEXT_PAGE_SIZE = 2
 _story_context_followup_calls: dict[str, dict[str, int]] = {}
@@ -58,6 +66,8 @@ _automation_context_cache: OrderedDict[str, dict] = OrderedDict()
 _AUTOMATION_CONTEXT_CACHE_LIMIT = 8
 _AUTOMATION_FILE_CHUNK_FOLLOWUP_LIMIT = 2
 _automation_file_chunk_followups: dict[str, dict[str, int]] = {}
+_testrail_export_previews: OrderedDict[str, dict] = OrderedDict()
+_TESTRAIL_EXPORT_PREVIEW_LIMIT = 8
 _AUTOMATION_CONTEXT_SECTIONS = (
     "test_case",
     "general_guidelines",
@@ -102,10 +112,12 @@ def _cache_automation_context(context: dict) -> str:
 def _cache_story_context(context: dict) -> str:
     context_id = uuid.uuid4().hex
     _story_context_cache[context_id] = deepcopy(context)
+    _story_context_payloads[context_id] = json.dumps(context, ensure_ascii=True)
     _story_context_cache.move_to_end(context_id)
     _story_context_followup_calls[context_id] = {}
     while len(_story_context_cache) > _STORY_CONTEXT_CACHE_LIMIT:
         expired_id, _ = _story_context_cache.popitem(last=False)
+        _story_context_payloads.pop(expired_id, None)
         _story_context_followup_calls.pop(expired_id, None)
     return context_id
 
@@ -207,16 +219,58 @@ def check_setup() -> dict:
 def get_story_context(issue_key: str, refresh: bool = False) -> dict:
     """Fetch a Jira story plus feature-scoped product knowledge, role permissions and related
     existing TestRail cases. Call this first for any analysis or test generation. Returns a
-    context_id for optional bounded follow-up with get_more_story_context."""
+    context_id for optional supporting-source follow-up with get_more_story_context.
+    Large responses return a manifest: read ALL get_story_context_page pages before analysis."""
     try:
         key = config.validate_issue_key(issue_key)
         if refresh:
             _context_cache.pop(key, None)
         context = _context(key)
         context_id = _cache_story_context(context)
-        return {"ok": True, "context_id": context_id, **context}
+        result = {"ok": True, "context_id": context_id, **context}
+        if len(json.dumps(result, ensure_ascii=True).encode("utf-8")) <= _STORY_CONTEXT_INLINE_BYTES:
+            return result
+        return {
+            "ok": True,
+            "context_id": context_id,
+            "paged": True,
+            "page_tool": "get_story_context_page",
+            "total_characters": len(_story_context_payloads[context_id]),
+            "next_offset": 0,
+            "instructions": (
+                "Read get_story_context_page(context_id, offset=0), then follow next_offset "
+                "until null. Concatenate content fragments in order to reconstruct the complete "
+                "JSON context, including exact source_text and warnings. Read every page before "
+                "analysis or generation; fragments are not individually valid JSON. "
+                "get_more_story_context retrieves additional supporting results, not these pages."
+            ),
+        }
     except (ValueError, jira_client.JiraError, retrieval.RetrievalError) as e:
         return _error(str(e))
+
+
+@mcp.tool()
+def get_story_context_page(context_id: str, offset: int = 0) -> dict:
+    """Read a bounded fragment of the initial story-context JSON snapshot, without file access.
+    Start at offset=0 and follow next_offset until null. Concatenate all content fragments
+    before interpreting the JSON; no requirements or source evidence are omitted."""
+    payload = _story_context_payloads.get(context_id)
+    if context_id not in _story_context_cache or payload is None:
+        return _error("Story context expired or is unknown. Call get_story_context again.")
+    if offset < 0 or offset > len(payload):
+        return _error("offset must be between zero and total_characters.")
+    _story_context_cache.move_to_end(context_id)
+    content = payload[offset:offset + _STORY_CONTEXT_TEXT_PAGE_SIZE]
+    end = offset + len(content)
+    return {
+        "ok": True,
+        "context_id": context_id,
+        "format": "json_fragment",
+        "offset": offset,
+        "content": content,
+        "total_characters": len(payload),
+        "next_offset": end if end < len(payload) else None,
+    }
 
 
 @mcp.tool()
@@ -585,6 +639,312 @@ def save_test_cases(issue_key: str, suite: TestCaseSuite) -> dict:
         "traceability_warnings": warnings,
         "grounding_review_flags": grounding_flags,
         "exact_duplicate_candidates": duplicate_candidates,
+    }
+
+
+def _read_test_case_artifact(issue_key: str) -> tuple[dict, str, TestCaseSuite]:
+    path = config.OUTPUT_DIR / f"{issue_key}-test-cases.json"
+    try:
+        raw = path.read_bytes()
+        payload = json.loads(raw.decode("utf-8"))
+    except FileNotFoundError as e:
+        raise ValueError(f"Saved test-case artifact not found: {path}") from e
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise ValueError(f"Could not read the saved test-case artifact: {type(e).__name__}.") from e
+    if not isinstance(payload, dict) or payload.get("source") != "copilot-cli":
+        raise ValueError("Artifact is not a QA Copilot CLI validated test-case artifact.")
+    story = payload.get("story")
+    if not isinstance(story, dict) or str(story.get("key", "")).upper() != issue_key:
+        raise ValueError("Saved artifact Jira key does not match the requested issue.")
+    try:
+        suite = TestCaseSuite.model_validate({
+            "requirements_brief": payload.get("requirements_brief"),
+            "test_cases": payload.get("test_cases"),
+            "critique": payload.get("critique"),
+        })
+    except ValidationError as e:
+        raise ValueError(f"Saved test-case artifact failed schema validation: {e}") from e
+    errors, _ = check_traceability(suite, str(story.get("primary_source", "")))
+    if errors:
+        raise ValueError("Saved test-case artifact failed traceability validation: " + "; ".join(errors))
+    return payload, hashlib.sha256(raw).hexdigest(), suite
+
+
+def _normalise_title(value: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", (value or "").casefold()))
+
+
+def _test_case_payload(
+    issue_key: str, suite_id: int, case, priorities: dict[str, dict]
+) -> dict:
+    step_objects = []
+    for line in case.steps.splitlines():
+        match = re.match(r"^\s*\d+\.\s*(.*)$", line)
+        if match and match.group(1).strip():
+            step_objects.append({"content": match.group(1).strip(), "expected": ""})
+        elif line.strip() and step_objects:
+            step_objects[-1]["content"] += " " + line.strip()
+    if step_objects:
+        step_objects[-1]["expected"] = case.expected_result
+    return {
+        "title": case.title,
+        "type_id": 2,
+        "priority_id": priorities[case.priority]["id"],
+        "custom_preconds": case.preconditions,
+        "custom_steps_separated": step_objects,
+        "custom_steps": case.steps,
+        "custom_expected": case.expected_result,
+        "refs": issue_key,
+        "labels": ["AI Generated Test"],
+        "suite_id": suite_id,
+    }
+
+
+def _find_testrail_duplicates(cases: list, live_cases: list[dict]) -> dict[str, list[dict]]:
+    titles: dict[str, list[dict]] = {}
+    for live in live_cases:
+        normalized = _normalise_title(str(live.get("title", "")))
+        if normalized:
+            titles.setdefault(normalized, []).append(live)
+    duplicates = {}
+    for case in cases:
+        matches = titles.get(_normalise_title(case.title), [])
+        if matches:
+            duplicates[case.tc_id] = [{
+                "case_id": f"C{item['id']}",
+                "title": item["title"],
+                "section_id": item.get("section_id"),
+            } for item in matches]
+    return duplicates
+
+
+def _destination_options(items: list[dict], kind: str, issue_key: str, show_all: bool) -> dict:
+    recommended = []
+    if issue_key:
+        key = config.validate_issue_key(issue_key)
+        story = _context(key)["story"]
+        feature = canonical_feature_key(str(story.get("feature_key", "")))
+        aliases = load_feature_aliases().get(feature, [])
+        phrases = {
+            _normalise_title(value.replace("-", " "))
+            for value in [feature, *aliases] if value
+        }
+        ignored = {
+            "the", "and", "for", "with", "from", "this", "that", "test", "tests",
+            "implement", "additional", "requirements", "found", "testing", "qa",
+        }
+        summary_terms = set(_normalise_title(str(story.get("summary", ""))).split()) - ignored
+        feature_terms = set(" ".join(phrases).split()) - ignored
+        scored = []
+        for item in items:
+            name = _normalise_title(item["name"])
+            terms = set(name.split())
+            score = (
+                10 * sum(f" {phrase} " in f" {name} " for phrase in phrases)
+                + 3 * len(terms & feature_terms)
+                + len(terms & summary_terms)
+            )
+            if score:
+                scored.append((score, item))
+        scored.sort(key=lambda entry: (-entry[0], entry[1]["name"].casefold(), entry[1]["id"]))
+        recommended = [item for _, item in scored]
+    options = items if show_all or not issue_key else recommended
+    return {
+        "ok": True,
+        kind: options,
+        "total_available": len(items),
+        "showing_all": show_all or not issue_key,
+        "selection_required": True,
+        "selection_prompt": (
+            "Show a numbered list with names and IDs, then wait for the user to select by "
+            "list number, name, or explicit ID. Offer show_all=True to see all options. "
+            "If input is ambiguous, ask for clarification; never select automatically. "
+            "If no recommendations match, offer show_all=True rather than invent a destination."
+        ),
+    }
+
+
+@mcp.tool()
+def get_testrail_suites(issue_key: str = "", show_all: bool = False) -> dict:
+    """Recommend existing suites by story summary/feature when issue_key is supplied.
+    Show the choices and WAIT for user input before requesting sections. show_all lists all
+    project suites; without issue_key this preserves the original unfiltered listing."""
+    try:
+        if issue_key:
+            issue_key = config.validate_issue_key(issue_key)
+        return _destination_options(testrail_client.list_suites(), "suites", issue_key, show_all)
+    except (ValueError, TestRailError, jira_client.JiraError, retrieval.RetrievalError) as e:
+        return _error(str(e))
+
+
+@mcp.tool()
+def get_testrail_sections(suite_id: int, issue_key: str = "", show_all: bool = False) -> dict:
+    """After the user chooses a suite, recommend its existing sections by story/feature.
+    Show choices and WAIT for user input before previewing. show_all lists all sections
+    in that suite; no suites or sections are created."""
+    try:
+        if issue_key:
+            issue_key = config.validate_issue_key(issue_key)
+        if not any(item["id"] == suite_id for item in testrail_client.list_suites()):
+            return _error("Selected suite is not in the configured TestRail project.")
+        return {
+            **_destination_options(
+                testrail_client.list_sections(suite_id), "sections", issue_key, show_all
+            ),
+            "suite_id": suite_id,
+        }
+    except (ValueError, TestRailError, jira_client.JiraError, retrieval.RetrievalError) as e:
+        return _error(str(e))
+
+
+@mcp.tool()
+def preview_test_cases_to_testrail(
+    issue_key: str,
+    selected_case_ids: list[str],
+    suite_id: int,
+    section_id: int,
+) -> dict:
+    """Create a read-only preview for selected saved cases, including exact-title duplicate warnings.
+    No TestRail writes occur until push_test_cases_to_testrail receives explicit user approval."""
+    try:
+        key = config.validate_issue_key(issue_key)
+        if not selected_case_ids or len(selected_case_ids) != len(set(selected_case_ids)):
+            return _error("Select one or more distinct generated tc_id values.")
+        target = testrail_client.validate_case_target(suite_id, section_id)
+        payload, digest, suite = _read_test_case_artifact(key)
+        available = {case.tc_id: case for case in suite.test_cases}
+        unknown = sorted(set(selected_case_ids) - set(available))
+        if unknown:
+            return _error(f"Selected test case IDs are not in the saved artifact: {unknown}")
+        selected = [available[case_id] for case_id in selected_case_ids]
+        priorities = testrail_client.export_priority_mapping()
+        duplicates = _find_testrail_duplicates(
+            selected,
+            testrail_client.list_cases(suite_id),
+        )
+        preview_id = uuid.uuid4().hex
+        preview = {
+            "issue_key": key,
+            "artifact_digest": digest,
+            "suite_id": int(suite_id),
+            "section_id": int(section_id),
+            "selected_case_ids": list(selected_case_ids),
+            "duplicates": duplicates,
+            "cases": [case.model_dump() for case in selected],
+            "priorities": priorities,
+        }
+        _testrail_export_previews[preview_id] = preview
+        _testrail_export_previews.move_to_end(preview_id)
+        while len(_testrail_export_previews) > _TESTRAIL_EXPORT_PREVIEW_LIMIT:
+            _testrail_export_previews.popitem(last=False)
+
+        return {
+            "ok": True,
+            "preview_id": preview_id,
+            "issue_key": key,
+            "target": {
+                "suite_id": target["suite"]["id"],
+                "suite_name": target["suite"]["name"],
+                "section_id": target["section"]["id"],
+                "section_name": target["section"]["name"],
+            },
+            "cases": [{
+                "tc_id": case.tc_id,
+                "title": case.title,
+                "priority": case.priority,
+                "testrail_priority": priorities[case.priority],
+                "preconditions": case.preconditions,
+                "steps": case.steps,
+                "expected_result": case.expected_result,
+                "jira_refs": [key],
+                "labels": ["AI Generated Test"],
+            } for case in selected],
+            "duplicate_warnings": [
+                {"tc_id": tc_id, "matches": matches}
+                for tc_id, matches in duplicates.items()
+            ],
+            "approval_required": True,
+            "approval_tool": "push_test_cases_to_testrail",
+        }
+    except (ValueError, TestRailError) as e:
+        return _error(str(e))
+
+
+@mcp.tool()
+def push_test_cases_to_testrail(
+    preview_id: str,
+    user_approved: bool = False,
+    duplicate_decisions: dict[str, str] | None = None,
+) -> dict:
+    """Create the cases from one preview only after explicit user approval.
+    duplicate_decisions must explicitly map every duplicate tc_id to 'create' or 'skip'.
+    Each write is attempted once; ambiguous outcomes must be checked in TestRail before any retry."""
+    preview = _testrail_export_previews.get(preview_id)
+    if preview is None:
+        return _error("Preview expired or is unknown. Create a fresh TestRail export preview.")
+    if not user_approved:
+        return _error("No TestRail write was performed. Obtain explicit user approval, then call again.")
+
+    decisions = duplicate_decisions or {}
+    duplicate_ids = set(preview["duplicates"])
+    if set(decisions) != duplicate_ids or any(value not in {"create", "skip"} for value in decisions.values()):
+        return _error(
+            "Provide an explicit 'create' or 'skip' decision for every duplicate warning, keyed by tc_id."
+        )
+    try:
+        _, digest, suite = _read_test_case_artifact(preview["issue_key"])
+        if digest != preview["artifact_digest"]:
+            _testrail_export_previews.pop(preview_id, None)
+            return _error("Saved artifact changed after preview; create a fresh preview before exporting.")
+        priorities = testrail_client.export_priority_mapping()
+        if priorities != preview["priorities"]:
+            _testrail_export_previews.pop(preview_id, None)
+            return _error("TestRail priorities changed since preview; review a fresh preview before exporting.")
+        available = {case.tc_id: case for case in suite.test_cases}
+        selected = [available[case_id] for case_id in preview["selected_case_ids"]]
+        target = testrail_client.validate_case_target(preview["suite_id"], preview["section_id"])
+        current_duplicates = _find_testrail_duplicates(
+            selected,
+            testrail_client.list_cases(preview["suite_id"]),
+        )
+        if current_duplicates != preview["duplicates"]:
+            _testrail_export_previews.pop(preview_id, None)
+            return _error("TestRail cases changed since preview; review a fresh preview before exporting.")
+    except (ValueError, TestRailError) as e:
+        return _error(str(e))
+
+    _testrail_export_previews.pop(preview_id, None)
+    results = []
+    skipped = []
+    for case in selected:
+        if case.tc_id in duplicate_ids and decisions[case.tc_id] == "skip":
+            skipped.append({"tc_id": case.tc_id, "title": case.title, "reason": "duplicate skipped by user"})
+            continue
+        try:
+            created = testrail_client.create_case(
+                preview["section_id"],
+                _test_case_payload(preview["issue_key"], preview["suite_id"], case, priorities),
+            )
+            results.append({
+                "tc_id": case.tc_id,
+                "title": case.title,
+                "status": "created",
+                "testrail_case_id": created["id"],
+            })
+        except TestRailError as e:
+            log.error("TestRail case creation failed for %s: %s", case.tc_id, e)
+            results.append({
+                "tc_id": case.tc_id,
+                "title": case.title,
+                "status": "failed",
+                "error": str(e),
+                "retry_guidance": "Check TestRail for this title before retrying; create requests are never retried automatically.",
+            })
+    return {
+        "ok": not any(item["status"] == "failed" for item in results),
+        "target": target,
+        "created": results,
+        "skipped": skipped,
     }
 
 

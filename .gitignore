@@ -28,6 +28,7 @@ custom-agent/reports/
 /rag/docs/product_knowledge/
 /rag/docs/automation/automation-guidelines.md
 /rag/docs/automation/feature-context/
+/rag/config/feature-aliases.json
 /rag/pdfs/*.pdf
 /rag/faiss_index/index.faiss
 /rag/faiss_index/index.pkl

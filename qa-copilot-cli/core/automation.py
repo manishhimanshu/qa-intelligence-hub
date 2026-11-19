@@ -33,9 +33,9 @@ def _feature_doc(feature_key: str) -> tuple[str, str]:
     canonical = canonical_feature_key(feature_key)
     if not canonical or not _FEATURE_CONTEXT_DIR.is_dir():
         return "", ""
-    for path in sorted(_FEATURE_CONTEXT_DIR.glob("*-feature-context.md")):
-        stem_key = canonical_feature_key(path.name.removesuffix("-feature-context.md"))
-        if stem_key == canonical:
+    for path in sorted(_FEATURE_CONTEXT_DIR.glob("*/*-feature-context.md")):
+        folder_key = canonical_feature_key(path.parent.name)
+        if folder_key == canonical:
             return path.read_text(encoding="utf-8", errors="ignore"), str(path)
     return "", ""
 

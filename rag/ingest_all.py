@@ -18,6 +18,11 @@ automatically picked up by the MCP retriever server.
 import os
 import sys
 
+if sys.platform == "win32":
+    import truststore
+
+    truststore.inject_into_ssl()
+
 # Load .env from this directory before anything else
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))

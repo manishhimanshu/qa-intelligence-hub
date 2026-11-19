@@ -14,6 +14,8 @@ import re
 import requests
 from typing import List, Dict
 
+_JIRA_KEY_RE = re.compile(r"(?<![A-Z0-9_])[A-Z][A-Z0-9_]+-\d+(?![A-Z0-9_-])", re.IGNORECASE)
+
 
 class _TestRailClient:
     def __init__(self, base_url: str, user: str, token: str):
@@ -77,11 +79,7 @@ def ingest_testrail_cases() -> List[Dict]:
     docs: List[Dict] = []
 
     # Fetch all suites in the project (paginated, wrapped in {"suites": [...]})
-    try:
-        suites = client.get_all(f"get_suites/{project_id}", "suites")
-    except Exception as e:
-        print(f"[testrail_ingest] Could not fetch suites: {e}")
-        suites = [{"id": None, "name": "Default"}]
+    suites = client.get_all(f"get_suites/{project_id}", "suites")
 
     for suite in suites:
         suite_id   = suite.get("id")
@@ -89,21 +87,14 @@ def ingest_testrail_cases() -> List[Dict]:
 
         # Fetch sections (paginated)
         section_map: Dict[int, str] = {}
-        try:
-            sec_endpoint = f"get_sections/{project_id}&suite_id={suite_id}" if suite_id else f"get_sections/{project_id}"
-            sections = client.get_all(sec_endpoint, "sections")
-            for s in sections:
-                section_map[s["id"]] = s.get("name", "")
-        except Exception:
-            pass
+        sec_endpoint = f"get_sections/{project_id}&suite_id={suite_id}" if suite_id else f"get_sections/{project_id}"
+        sections = client.get_all(sec_endpoint, "sections")
+        for s in sections:
+            section_map[s["id"]] = s.get("name", "")
 
         # Fetch test cases (paginated, wrapped in {"cases": [...]})
         cases_endpoint = f"get_cases/{project_id}&suite_id={suite_id}" if suite_id else f"get_cases/{project_id}"
-        try:
-            cases = client.get_all(cases_endpoint, "cases")
-        except Exception as e:
-            print(f"[testrail_ingest] Could not fetch cases for suite {suite_name}: {e}")
-            continue
+        cases = client.get_all(cases_endpoint, "cases")
 
         for case in cases:
             case_id    = case.get("id")
@@ -111,6 +102,10 @@ def ingest_testrail_cases() -> List[Dict]:
             section    = section_map.get(section_id, "")
             priority_map = {1: "Critical", 2: "High", 3: "Medium", 4: "Low"}
             priority   = priority_map.get(case.get("priority_id"), "Medium")
+            jira_refs = sorted({
+                match.group(0).upper()
+                for match in _JIRA_KEY_RE.finditer(str(case.get("refs") or ""))
+            })
 
             steps          = _strip_html(case.get("custom_steps", "") or "")
             expected       = _strip_html(case.get("custom_expected", "") or "")
@@ -139,9 +134,10 @@ def ingest_testrail_cases() -> List[Dict]:
                 f"Suite: {suite_name} | Section: {section}\n"
                 f"Priority: {priority}\n"
                 f"Title: {case.get('title', '')}\n"
-                f"Preconditions: {preconds}\n"
-                f"Steps:\n{steps}\n"
-                f"Expected Result:\n{expected}"
+                + (f"Jira References: {', '.join(jira_refs)}\n" if jira_refs else "")
+                + f"Preconditions: {preconds}\n"
+                + f"Steps:\n{steps}\n"
+                + f"Expected Result:\n{expected}"
             ).strip()
 
             docs.append({
@@ -151,6 +147,7 @@ def ingest_testrail_cases() -> List[Dict]:
                 "suite":   suite_name,
                 "section": section,
                 "priority": priority,
+                "jira_refs": jira_refs,
             })
 
     return docs

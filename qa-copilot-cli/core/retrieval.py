@@ -5,6 +5,8 @@ from functools import lru_cache
 from . import config
 from .feature_resolver import canonical_feature_key, resolve_feature_key
 
+_JIRA_KEY_RE = re.compile(r"(?<![A-Z0-9_])[A-Z][A-Z0-9_]+-\d+(?![A-Z0-9_-])", re.IGNORECASE)
+
 
 class RetrievalError(RuntimeError):
     pass
@@ -415,6 +417,23 @@ def _clean_testrail_text(content: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+def _extract_jira_refs(value) -> set[str]:
+    if isinstance(value, (list, tuple, set)):
+        text = " ".join(str(item) for item in value)
+    else:
+        text = str(value or "")
+    return {match.group(0).upper() for match in _JIRA_KEY_RE.finditer(text)}
+
+
+def _contains_jira_key(text: str, story_key: str) -> bool:
+    key = re.escape(story_key.strip())
+    return bool(key and re.search(
+        rf"(?<![A-Z0-9_]){key}(?![A-Z0-9_-])",
+        text or "",
+        re.IGNORECASE,
+    ))
+
+
 @lru_cache(maxsize=1)
 def _all_testrail_case_chunks() -> dict[str, list[dict]]:
     """Index local TestRail chunks once so candidate cases can be reconstructed completely."""
@@ -432,6 +451,7 @@ def _all_testrail_case_chunks() -> dict[str, list[dict]]:
         grouped.setdefault(case_id, {})[chunk_number] = {
             "id": doc_id,
             "content": getattr(d, "page_content", "") or "",
+            "jira_refs": _extract_jira_refs(meta.get("jira_refs")),
         }
     return {
         case_id: [chunks[n] for n in sorted(chunks)]
@@ -459,13 +479,22 @@ def get_existing_testrail_cases(
             seen_case_ids.add(case_id)
 
     all_chunks = _all_testrail_case_chunks()
-    story_key_l = story_key.lower()
-    linked_case_ids = [
-        case_id for case_id, chunks in all_chunks.items()
-        if any(story_key_l in chunk["content"].lower() for chunk in chunks)
-    ]
+    story_key_l = story_key.upper()
+    semantic_rank = {case_id: rank for rank, case_id in enumerate(ranked_case_ids)}
+    linked_case_ids = []
+    for case_id, chunks in all_chunks.items():
+        if any(
+            story_key_l in chunk.get("jira_refs", set())
+            or _contains_jira_key(chunk["content"], story_key)
+            for chunk in chunks
+        ):
+            linked_case_ids.append(case_id)
+    linked_case_ids.sort(
+        key=lambda case_id: (semantic_rank.get(case_id, float("inf")), int(case_id[1:]))
+    )
+    linked_case_set = set(linked_case_ids)
     ordered_case_ids = linked_case_ids + [
-        case_id for case_id in ranked_case_ids if case_id not in set(linked_case_ids)
+        case_id for case_id in ranked_case_ids if case_id not in linked_case_set
     ]
 
     header_prefixes = (
@@ -488,7 +517,11 @@ def get_existing_testrail_cases(
         merged = "\n".join(lines).strip()[:1500]
         title = re.search(r"Title:\s*(.+)", merged)
         title = title.group(1).strip()[:160] if title else ""
-        jira_linked = any(story_key_l in chunk.lower() for chunk in chunks)
+        jira_linked = any(
+            story_key_l in chunk.get("jira_refs", set())
+            or _contains_jira_key(chunk["content"], story_key)
+            for chunk in all_chunks.get(case_id, [])
+        )
         case_feature = resolve_feature_key(title, extra_text=merged)
         if feature_key and case_feature != feature_key and not jira_linked:
             continue
@@ -497,7 +530,15 @@ def get_existing_testrail_cases(
             "title": title,
             "content": merged,
             "jira_linked": jira_linked,
+            "_semantic_rank": semantic_rank.get(case_id, float("inf")),
         })
-    cases.sort(key=lambda case: (not case["jira_linked"], not bool(case["title"])))
+    cases.sort(key=lambda case: (
+        not case["jira_linked"],
+        case["_semantic_rank"],
+        int(case["id"][1:]),
+    ))
     start = max(0, offset)
-    return cases[start:start + max(1, top_k)]
+    page = cases[start:start + max(1, top_k)]
+    for case in page:
+        case.pop("_semantic_rank", None)
+    return page

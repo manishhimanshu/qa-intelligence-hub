@@ -141,7 +141,7 @@ def _normalize_feature_key(value: str) -> str:
 @st.cache_data(show_spinner=False)
 def load_feature_aliases() -> dict:
     """Load canonical feature aliases used for deterministic feature-scoped retrieval."""
-    path = os.path.join(_DIR, "../../rag/docs/automation/feature-context/feature-aliases.json")
+    path = os.path.join(_DIR, "../../rag/config/feature-aliases.json")
     defaults = {
         "notes": ["notes", "note"],
         "archive-content-type": [
@@ -3744,4 +3744,3 @@ with tab4:
                     )
             else:
                 st.caption("No feature-context utilization mapping returned.")
-

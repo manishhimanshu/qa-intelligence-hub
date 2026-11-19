@@ -30,7 +30,7 @@ TESTRAIL_PROJECT_ID = os.getenv("TESTRAIL_PROJECT_ID", "")
 
 FAISS_INDEX_DIR = RAG_DIR / os.getenv("FAISS_INDEX_PATH", "./faiss_index").lstrip("./")
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-FEATURE_ALIASES_PATH = RAG_DIR / "docs" / "automation" / "feature-context" / "feature-aliases.json"
+FEATURE_ALIASES_PATH = RAG_DIR / "config" / "feature-aliases.json"
 
 OUTPUT_DIR = Path(os.getenv("QA_CLI_OUTPUT_DIR", str(CLI_ROOT / "output"))).resolve()
 _automation_repo_root = os.getenv("AUTOMATION_REPO_ROOT", "").strip()

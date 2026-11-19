@@ -8,7 +8,7 @@ description: Analyze Jira stories for requirement gaps, ambiguity, testability, 
 ## Procedure
 
 1. Call `qa-hub/get_story_context` for the issue. Stop and report the error if it fails. Surface all context warnings.
-2. If the tool reports an output-too-large or temp-file condition, do not attempt to read the temp file, browser-navigate to it, or use Playwright to access it. Instead, stop and ask for the full AC/STR or a narrower payload. Report the limitation explicitly, and do not claim the story was fully analyzed from partial output.
+2. If the response has `paged: true`, call `qa-hub/get_story_context_page(context_id, offset=0)` and follow `next_offset` until null. Concatenate all `content` fragments in order to reconstruct the complete JSON context, including exact `source_text` and warnings. Read every page before analyzing; individual fragments may split JSON strings. Do not use `get_more_story_context` as a substitute for these pages. If an older server still returns an oversized response, report that the QA Hub server needs restarting/updating; do not analyze the partial preview or use Playwright to read it.
 3. State the requirement source: AC, Steps to Reproduce, description (only when AC/STR are absent), or summary only.
 4. Summarize only behavior explicitly stated in that source. Use comments as BA/PO clarification. Treat description/dev notes as context when AC or STR exist.
 5. Use feature-scoped product documentation and role permissions to understand terms and identify relevant questions. Do not turn product behavior absent from the Jira story into a story requirement.
@@ -20,7 +20,7 @@ description: Analyze Jira stories for requirement gaps, ambiguity, testability, 
 ## Guardrails
 
 - Do not use Playwright MCP during Jira story analysis. Playwright is not a requirement-reading tool and must not be triggered by a story-analysis request.
-- Do not bypass output limits by trying to read the temp file that the tool saved. This is not a supported workflow and should be treated as a hard limitation, not a workaround.
+- Use the bounded QA Hub story-context page tool for large responses; do not use Playwright or shell workarounds to access temporary files.
 - Do not invent requirements or gaps. Do not add generic network/API failure, timeout, offline, server-error, concurrency, performance, load/stress, or browser-compatibility items unless the authoritative Jira source explicitly mentions them. Preserve flagged items for review; never claim the saver silently removed them.
 
 ## Grounding

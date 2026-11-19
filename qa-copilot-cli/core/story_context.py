@@ -86,7 +86,7 @@ def build_story_context(key: str, include_comments: bool = False) -> dict:
     if not feature_key:
         warnings.append(
             "No canonical feature key resolved; product knowledge is omitted. "
-            "Add an alias to rag/docs/automation/feature-context/feature-aliases.json if needed."
+            "Add an alias to rag/config/feature-aliases.json if needed."
         )
     elif not product_knowledge:
         warnings.append(f"No product knowledge indexed for feature '{feature_key}'.")

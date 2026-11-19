@@ -32,9 +32,11 @@ def _infer_md_metadata(source_file: str, docs_dir: str) -> Dict:
 
     if "automation/feature-context/" in lower:
         meta["doc_domain"] = "automation_feature_context"
-        fname = os.path.basename(lower)
-        feature = fname.replace(".md", "")
-        feature = feature.replace("-feature-context", "")
+        feature_path = lower.split("automation/feature-context/", 1)[1].split("/")
+        if len(feature_path) > 1:
+            feature = feature_path[0]
+        else:
+            feature = feature_path[0].removesuffix(".md").removesuffix("-feature-context")
         meta["feature_key"] = _normalize_feature_key(feature)
         return meta
 

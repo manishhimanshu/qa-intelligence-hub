@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core import config  # noqa: E402
 from core import automation  # noqa: E402
 from core import story_context  # noqa: E402
+from core import testrail_client  # noqa: E402
 from core.feature_resolver import canonical_feature_key, resolve_feature_key  # noqa: E402
 from core.markdown import render_gap_analysis, render_test_cases  # noqa: E402
 from core import retrieval  # noqa: E402
@@ -21,6 +23,7 @@ from core.parsing import (  # noqa: E402
     normalize_ticket,
 )
 from core.testrail_client import TestRailError, fetch_case, normalize_case_id  # noqa: E402
+from rag.ingest import testrail_ingest  # noqa: E402
 from core.schemas import (  # noqa: E402
     GapAnalysis,
     TestCaseSuite,
@@ -114,6 +117,52 @@ class ParsingTests(unittest.TestCase):
 
 
 class FeatureAndKeyTests(unittest.TestCase):
+    def test_shared_role_permissions_ingestion_preserves_domain_and_ids(self):
+        from rag.ingest.md_ingest import ingest_markdown_dir
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            document = root / "shared" / "role-permissions.md"
+            document.parent.mkdir()
+            document.write_text("# Roles\n## Universal Role Rules\nAdmins manage access.", encoding="utf-8")
+            chunks = ingest_markdown_dir(str(root))
+            self.assertEqual(len(chunks), 2)
+            self.assertEqual(chunks[0]["id"], "role-permissions.md_0")
+            self.assertTrue(all(chunk["doc_domain"] == "role_permissions" for chunk in chunks))
+            self.assertTrue(all(chunk["relative_source_path"] == "shared/role-permissions.md" for chunk in chunks))
+            self.assertTrue(all("role-permissions" in chunk["source"] for chunk in chunks))
+
+    def test_feature_alias_configuration_location(self):
+        self.assertEqual(config.FEATURE_ALIASES_PATH, config.RAG_DIR / "config" / "feature-aliases.json")
+
+    def test_automation_context_uses_canonical_feature_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            nested = root / "notes" / "notes-feature-context.md"
+            nested.parent.mkdir()
+            nested.write_text("Notes guidance", encoding="utf-8")
+            (root / "notes-feature-context.md").write_text("Old flat guidance", encoding="utf-8")
+            with mock.patch.object(automation, "_FEATURE_CONTEXT_DIR", root):
+                text, path = automation._feature_doc("note")
+                self.assertEqual(text, "Notes guidance")
+                self.assertEqual(Path(path), nested)
+                self.assertEqual(automation._feature_doc("unknown"), ("", ""))
+
+    def test_nested_automation_ingestion_uses_folder_feature(self):
+        from rag.ingest.md_ingest import _infer_md_metadata, ingest_markdown_dir
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            document = root / "automation" / "feature-context" / "notes" / "notes-feature-context.md"
+            document.parent.mkdir(parents=True)
+            document.write_text("# Notes\nFeature guidance", encoding="utf-8")
+            meta = _infer_md_metadata(str(document), str(root))
+            self.assertEqual(meta["feature_key"], "notes")
+            self.assertEqual(meta["doc_domain"], "automation_feature_context")
+            self.assertEqual(meta["relative_source_path"], "automation/feature-context/notes/notes-feature-context.md")
+            chunks = ingest_markdown_dir(str(root))
+            self.assertEqual(len(chunks), 1)
+            self.assertEqual(chunks[0]["feature_key"], "notes")
+            self.assertEqual(chunks[0]["id"], "notes-feature-context.md_0")
+
     def test_resolves_notes_as_whole_token(self):
         self.assertEqual(resolve_feature_key("Notes: add checklist"), "notes")
 
@@ -418,6 +467,84 @@ class RetrievalTests(unittest.TestCase):
                 "STUD-1", "Notes editor", "notes", top_k=1, offset=1
             )
         self.assertEqual([case["id"] for case in page], ["C456"])
+
+    def test_existing_testrail_cases_prioritize_exact_jira_refs(self):
+        chunks = {
+            "C123": [{
+                "id": "testrail_123",
+                "content": "TestRail Case: 123\nTitle: Notes editor saves a page",
+                "jira_refs": {"STUD-123"},
+            }],
+            "C456": [{
+                "id": "testrail_456",
+                "content": "TestRail Case: 456\nTitle: Notes editor saves a book",
+                "jira_refs": set(),
+            }],
+        }
+        semantic_hits = [{"id": "testrail_456_chunk0", "content": "similar result"}]
+        with (
+            mock.patch.object(retrieval, "search_filtered", return_value=semantic_hits),
+            mock.patch.object(retrieval, "_all_testrail_case_chunks", return_value=chunks),
+        ):
+            cases = retrieval.get_existing_testrail_cases("STUD-123", "Notes editor", "notes")
+
+        self.assertEqual([case["id"] for case in cases], ["C123", "C456"])
+        self.assertTrue(cases[0]["jira_linked"])
+
+    def test_existing_testrail_reference_match_does_not_match_key_prefix(self):
+        chunks = {
+            "C123": [{
+                "id": "testrail_123",
+                "content": "TestRail Case: 123\nTitle: Notes editor saves a page",
+                "jira_refs": {"STUD-123"},
+            }],
+        }
+        with (
+            mock.patch.object(retrieval, "search_filtered", return_value=[]),
+            mock.patch.object(retrieval, "_all_testrail_case_chunks", return_value=chunks),
+        ):
+            cases = retrieval.get_existing_testrail_cases("STUD-12", "Unrelated story", "notes")
+
+        self.assertEqual(cases, [])
+
+
+class TestRailIngestionTests(unittest.TestCase):
+    def test_ingestion_preserves_jira_refs_in_content_and_metadata(self):
+        class FakeClient:
+            def __init__(self, *args):
+                pass
+
+            def get_all(self, endpoint, list_key):
+                if list_key == "suites":
+                    return [{"id": 7, "name": "Notes"}]
+                if list_key == "sections":
+                    return [{"id": 8, "name": "Editor"}]
+                if list_key == "cases":
+                    return [{
+                        "id": 123,
+                        "section_id": 8,
+                        "priority_id": 2,
+                        "title": "Notes editor saves a page",
+                        "refs": "STUD-123, STUD-456",
+                        "custom_preconds": "",
+                        "custom_steps": "Open Notes",
+                        "custom_expected": "The page is saved",
+                    }]
+                return []
+
+        with (
+            mock.patch.dict(os.environ, {
+                "TESTRAIL_URL": "https://testrail.example",
+                "TESTRAIL_USER": "qa@example.test",
+                "TESTRAIL_TOKEN": "test-token",
+                "TESTRAIL_PROJECT_ID": "7",
+            }),
+            mock.patch.object(testrail_ingest, "_TestRailClient", FakeClient),
+        ):
+            docs = testrail_ingest.ingest_testrail_cases()
+
+        self.assertEqual(docs[0]["jira_refs"], ["STUD-123", "STUD-456"])
+        self.assertIn("Jira References: STUD-123, STUD-456", docs[0]["content"])
 
 
 class AutomationTests(unittest.TestCase):
@@ -808,6 +935,81 @@ class AutomationTests(unittest.TestCase):
                 _get("get_case/12345")
         request.assert_not_called()
 
+    def test_export_priorities_resolve_names_not_numeric_order(self):
+        data = [
+            {"id": 501, "name": "1 - Base level test"},
+            {"id": 301, "name": "3 - Functional"},
+            {"id": 201, "name": "4 - Edge case"},
+            {"id": 101, "name": "5 - Don't Test"},
+        ]
+        with mock.patch.object(testrail_client, "_get", return_value=data) as get:
+            mapping = testrail_client.export_priority_mapping()
+        get.assert_called_once_with("get_priorities")
+        self.assertEqual(
+            {key: value["id"] for key, value in mapping.items()},
+            {"Critical": 501, "High": 301, "Medium": 301, "Low": 201},
+        )
+        for invalid in ([], data[1:], [*data, data[0]], {"priorities": data}):
+            with self.subTest(data=invalid):
+                with mock.patch.object(testrail_client, "_get", return_value=invalid):
+                    with self.assertRaises(TestRailError):
+                        testrail_client.export_priority_mapping()
+
+    def test_testrail_case_creation_posts_once_to_selected_section(self):
+        class Response:
+            status_code = 200
+            ok = True
+
+            @staticmethod
+            def json():
+                return {"id": 345, "title": "Notes editor creates a page"}
+
+        payload = {"title": "Notes editor creates a page", "suite_id": 7}
+        with (
+            mock.patch.object(config, "TESTRAIL_URL", "https://testrail.example.com"),
+            mock.patch.object(config, "TESTRAIL_USER", "qa@example.com"),
+            mock.patch.object(config, "TESTRAIL_TOKEN", "hidden-test-token"),
+            mock.patch("core.testrail_client.requests.request", return_value=Response()) as request,
+        ):
+            result = testrail_client.create_case(8, payload)
+
+        self.assertEqual(result["id"], "C345")
+        request.assert_called_once()
+        self.assertEqual(request.call_args.args[:2], (
+            "POST",
+            "https://testrail.example.com/index.php?/api/v2/add_case/8",
+        ))
+        self.assertEqual(request.call_args.kwargs["json"], payload)
+        self.assertEqual(request.call_args.kwargs["timeout"], 20)
+        self.assertEqual(request.call_args.kwargs["auth"], ("qa@example.com", "hidden-test-token"))
+
+    def test_testrail_target_validation_requires_section_in_selected_project_suite(self):
+        with (
+            mock.patch.object(config, "TESTRAIL_PROJECT_ID", "7"),
+            mock.patch.object(testrail_client, "_get_all", side_effect=[
+                [{"id": 7, "name": "Regression"}],
+                [{"id": 8, "name": "Notes", "suite_id": 7}],
+            ]) as get_all,
+        ):
+            target = testrail_client.validate_case_target(7, 8)
+        self.assertEqual(target["suite"]["name"], "Regression")
+        self.assertEqual(target["section"]["name"], "Notes")
+        self.assertEqual(get_all.call_args_list[0].args, ("get_suites/7", "suites"))
+        self.assertEqual(
+            get_all.call_args_list[1].args,
+            ("get_sections/7&suite_id=7", "sections"),
+        )
+
+        with (
+            mock.patch.object(config, "TESTRAIL_PROJECT_ID", "7"),
+            mock.patch.object(testrail_client, "_get_all", side_effect=[
+                [{"id": 7, "name": "Regression"}],
+                [{"id": 9, "name": "Ideas", "suite_id": 7}],
+            ]),
+        ):
+            with self.assertRaisesRegex(TestRailError, "does not belong"):
+                testrail_client.validate_case_target(7, 8)
+
     def test_testrail_spec_writer_requires_approval_and_refuses_overwrite(self):
         case = {
             "case_id": "C12345", "title": "Notes editor creates a page", "section_name": "Notes",
@@ -845,10 +1047,18 @@ class ServerSaveTests(unittest.TestCase):
     def setUp(self):
         import mcp_server
         self.server = mcp_server
+        self.previous_previews = mcp_server._testrail_export_previews.copy()
+        mcp_server._testrail_export_previews.clear()
         self.tmp = tempfile.TemporaryDirectory()
         self.patches = [
             mock.patch.object(config, "OUTPUT_DIR", Path(self.tmp.name)),
             mock.patch.object(mcp_server, "_context", return_value=self.context),
+            mock.patch.object(testrail_client, "export_priority_mapping", return_value={
+                "Critical": {"id": 5, "name": "1 - Base level test"},
+                "High": {"id": 3, "name": "3 - Functional"},
+                "Medium": {"id": 3, "name": "3 - Functional"},
+                "Low": {"id": 2, "name": "4 - Edge case"},
+            }),
         ]
         for p in self.patches:
             p.start()
@@ -856,6 +1066,8 @@ class ServerSaveTests(unittest.TestCase):
     def tearDown(self):
         for p in self.patches:
             p.stop()
+        self.server._testrail_export_previews.clear()
+        self.server._testrail_export_previews.update(self.previous_previews)
         self.tmp.cleanup()
 
     def test_save_writes_json_and_markdown_and_flags_ungrounded(self):
@@ -900,6 +1112,265 @@ class ServerSaveTests(unittest.TestCase):
         md = Path(result["markdown_path"]).read_text(encoding="utf-8")
         self.assertIn("Grounding Review Flags", md)
         self.assertIn("Performance under high load", md)
+
+    def test_testrail_destination_recommendations_and_show_all(self):
+        suites = [
+            {"id": 7, "name": "Notes regression"},
+            {"id": 9, "name": "Gallery"},
+        ]
+        sections = [
+            {"id": 20, "name": "Books", "suite_id": 7},
+            {"id": 21, "name": "Archive", "suite_id": 7},
+        ]
+        with (
+            mock.patch.object(testrail_client, "list_suites", return_value=suites),
+            mock.patch.object(testrail_client, "list_sections", return_value=sections) as list_sections,
+        ):
+            matched = self.server.get_testrail_suites(issue_key="STUD-1")
+            self.assertEqual([item["id"] for item in matched["suites"]], [7])
+            self.assertEqual(matched["total_available"], 2)
+            self.assertTrue(matched["selection_required"])
+            all_suites = self.server.get_testrail_suites(issue_key="STUD-1", show_all=True)
+            self.assertEqual(len(all_suites["suites"]), 2)
+            legacy = self.server.get_testrail_suites()
+            self.assertEqual(legacy["suites"], suites)
+            matched_sections = self.server.get_testrail_sections(7, issue_key="STUD-1")
+            self.assertEqual([item["id"] for item in matched_sections["sections"]], [20])
+            self.assertEqual(list_sections.call_args.args, (7,))
+            all_sections = self.server.get_testrail_sections(7, issue_key="STUD-1", show_all=True)
+            self.assertEqual(len(all_sections["sections"]), 2)
+            invalid_suite = self.server.get_testrail_sections(99, issue_key="STUD-1")
+            self.assertFalse(invalid_suite["ok"])
+        self.assertFalse(self.server.get_testrail_suites(issue_key="../bad")["ok"])
+
+    def test_testrail_destination_recommendations_no_match_and_alias_match(self):
+        context = {"story": {"summary": "Implement additional requirements", "feature_key": "gallery-natural-language-search"}}
+        with (
+            mock.patch.object(self.server, "_context", return_value=context),
+            mock.patch.object(self.server, "load_feature_aliases", return_value={
+                "gallery-natural-language-search": ["nls", "natural-language-search"],
+            }),
+            mock.patch.object(testrail_client, "list_suites", return_value=[
+                {"id": 1, "name": "NLS"},
+                {"id": 2, "name": "NLS Regression"},
+                {"id": 3, "name": "Signals"},
+            ]),
+        ):
+            matched = self.server.get_testrail_suites("STUD-1")
+            self.assertEqual([item["id"] for item in matched["suites"]], [1, 2])
+            context["story"]["feature_key"] = ""
+            none = self.server.get_testrail_suites("STUD-1")
+            self.assertEqual(none["suites"], [])
+            self.assertIn("show_all", none["selection_prompt"])
+
+    def test_testrail_export_preview_requires_approval_and_duplicate_decision(self):
+        first = _case(title="[FR-01] Create a book verifies it appears in the book list")
+        second = _case(
+            "TC-FEATURE-002",
+            title="[FR-01] Rename a book verifies the new name is displayed",
+        )
+        self.assertTrue(self.server.save_test_cases("STUD-1", _suite([first, second]))["ok"])
+        target = {
+            "suite": {"id": 7, "name": "Regression"},
+            "section": {"id": 8, "name": "Notes"},
+        }
+        live_cases = [
+            {"id": 900, "title": first["title"], "section_id": 8},
+        ]
+        with (
+            mock.patch.object(self.server.testrail_client, "validate_case_target", return_value=target),
+            mock.patch.object(self.server.testrail_client, "list_cases", return_value=live_cases),
+            mock.patch.object(self.server.testrail_client, "create_case", return_value={
+                "id": "C901", "title": second["title"],
+            }) as create_case,
+        ):
+            preview = self.server.preview_test_cases_to_testrail(
+                "STUD-1",
+                ["TC-FEATURE-001", "TC-FEATURE-002"],
+                7,
+                8,
+            )
+            self.assertTrue(preview["ok"], preview)
+            self.assertEqual(preview["cases"][1]["jira_refs"], ["STUD-1"])
+            self.assertEqual(preview["cases"][1]["testrail_priority"], {
+                "id": 3, "name": "3 - Functional",
+            })
+            self.assertEqual(preview["cases"][1]["labels"], ["AI Generated Test"])
+            self.assertEqual(preview["duplicate_warnings"][0]["tc_id"], "TC-FEATURE-001")
+            self.assertFalse(self.server.push_test_cases_to_testrail(preview["preview_id"])["ok"])
+            missing_decision = self.server.push_test_cases_to_testrail(
+                preview["preview_id"], user_approved=True
+            )
+            self.assertFalse(missing_decision["ok"])
+            result = self.server.push_test_cases_to_testrail(
+                preview["preview_id"],
+                user_approved=True,
+                duplicate_decisions={"TC-FEATURE-001": "skip"},
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["skipped"][0]["tc_id"], "TC-FEATURE-001")
+        self.assertEqual(result["created"][0]["testrail_case_id"], "C901")
+        create_case.assert_called_once()
+        self.assertEqual(create_case.call_args.args[0], 8)
+        sent = create_case.call_args.args[1]
+        self.assertEqual(sent["refs"], "STUD-1")
+        self.assertEqual(sent["priority_id"], 3)
+        self.assertEqual(sent["labels"], ["AI Generated Test"])
+        self.assertEqual(sent["custom_steps_separated"][0]["content"], "Open Notes")
+        self.assertEqual(
+            sent["custom_steps_separated"][-1]["expected"],
+            "A new book tab is displayed",
+        )
+
+    def test_testrail_export_requires_fresh_preview_when_saved_artifact_changes(self):
+        self.assertTrue(self.server.save_test_cases("STUD-1", _suite([_case()]))["ok"])
+        with (
+            mock.patch.object(self.server.testrail_client, "validate_case_target", return_value={
+                "suite": {"id": 7, "name": "Regression"},
+                "section": {"id": 8, "name": "Notes"},
+            }),
+            mock.patch.object(self.server.testrail_client, "list_cases", return_value=[]),
+            mock.patch.object(self.server.testrail_client, "create_case") as create_case,
+        ):
+            preview = self.server.preview_test_cases_to_testrail(
+                "STUD-1", ["TC-FEATURE-001"], 7, 8
+            )
+            output_path = Path(self.tmp.name) / "STUD-1-test-cases.json"
+            output_path.write_text(output_path.read_text(encoding="utf-8") + " ", encoding="utf-8")
+            result = self.server.push_test_cases_to_testrail(
+                preview["preview_id"], user_approved=True
+            )
+        self.assertFalse(result["ok"])
+        self.assertIn("changed after preview", result["error"])
+        create_case.assert_not_called()
+
+    def test_testrail_export_payload_maps_every_priority_and_uses_story_only_refs(self):
+        priorities = testrail_client.export_priority_mapping()
+        for priority, expected_id in (("Critical", 5), ("High", 3), ("Medium", 3), ("Low", 2)):
+            with self.subTest(priority=priority):
+                case = _suite([_case(priority=priority)]).test_cases[0]
+                payload = self.server._test_case_payload("STUD-1", 7, case, priorities)
+                self.assertEqual(payload["priority_id"], expected_id)
+                self.assertNotEqual(payload["priority_id"], 1)
+                self.assertEqual(payload["refs"], "STUD-1")
+                self.assertEqual(payload["labels"], ["AI Generated Test"])
+
+    def test_testrail_export_blocks_preview_when_priority_configuration_is_missing(self):
+        self.assertTrue(self.server.save_test_cases("STUD-1", _suite([_case()]))["ok"])
+        with (
+            mock.patch.object(testrail_client, "validate_case_target", return_value={
+                "suite": {"id": 7, "name": "Regression"},
+                "section": {"id": 8, "name": "Notes"},
+            }),
+            mock.patch.object(
+                testrail_client, "export_priority_mapping",
+                side_effect=TestRailError("Required priority missing; export blocked."),
+            ),
+            mock.patch.object(testrail_client, "create_case") as create_case,
+        ):
+            result = self.server.preview_test_cases_to_testrail("STUD-1", ["TC-FEATURE-001"], 7, 8)
+        self.assertFalse(result["ok"])
+        self.assertIn("export blocked", result["error"])
+        self.assertEqual(len(self.server._testrail_export_previews), 0)
+        create_case.assert_not_called()
+
+    def test_testrail_export_rejects_priority_changes_after_preview(self):
+        self.assertTrue(self.server.save_test_cases("STUD-1", _suite([_case()]))["ok"])
+        with (
+            mock.patch.object(testrail_client, "validate_case_target", return_value={
+                "suite": {"id": 7, "name": "Regression"},
+                "section": {"id": 8, "name": "Notes"},
+            }),
+            mock.patch.object(testrail_client, "list_cases", return_value=[]),
+            mock.patch.object(testrail_client, "create_case") as create_case,
+        ):
+            preview = self.server.preview_test_cases_to_testrail("STUD-1", ["TC-FEATURE-001"], 7, 8)
+            changed = dict(testrail_client.export_priority_mapping())
+            changed["High"] = {"id": 99, "name": "3 - Functional"}
+            with mock.patch.object(testrail_client, "export_priority_mapping", return_value=changed):
+                result = self.server.push_test_cases_to_testrail(preview["preview_id"], user_approved=True)
+        self.assertFalse(result["ok"])
+        self.assertIn("priorities changed", result["error"])
+        create_case.assert_not_called()
+
+    def test_testrail_export_does_not_retry_failed_create(self):
+        self.assertTrue(self.server.save_test_cases("STUD-1", _suite([_case()]))["ok"])
+        with (
+            mock.patch.object(self.server.testrail_client, "validate_case_target", return_value={
+                "suite": {"id": 7, "name": "Regression"},
+                "section": {"id": 8, "name": "Notes"},
+            }),
+            mock.patch.object(self.server.testrail_client, "list_cases", return_value=[]),
+            mock.patch.object(
+                self.server.testrail_client,
+                "create_case",
+                side_effect=TestRailError("write result unknown"),
+            ) as create_case,
+        ):
+            preview = self.server.preview_test_cases_to_testrail(
+                "STUD-1", ["TC-FEATURE-001"], 7, 8
+            )
+            result = self.server.push_test_cases_to_testrail(
+                preview["preview_id"], user_approved=True
+            )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["created"][0]["status"], "failed")
+        self.assertIn("never retried automatically", result["created"][0]["retry_guidance"])
+        create_case.assert_called_once()
+
+    def test_testrail_export_creates_duplicate_only_after_explicit_create_decision(self):
+        case = _case()
+        self.assertTrue(self.server.save_test_cases("STUD-1", _suite([case]))["ok"])
+        target = {
+            "suite": {"id": 7, "name": "Regression"},
+            "section": {"id": 8, "name": "Notes"},
+        }
+        live_cases = [{"id": 900, "title": case["title"], "section_id": 8}]
+        with (
+            mock.patch.object(self.server.testrail_client, "validate_case_target", return_value=target),
+            mock.patch.object(self.server.testrail_client, "list_cases", return_value=live_cases),
+            mock.patch.object(self.server.testrail_client, "create_case", return_value={
+                "id": "C901", "title": case["title"],
+            }) as create_case,
+        ):
+            preview = self.server.preview_test_cases_to_testrail(
+                "STUD-1", ["TC-FEATURE-001"], 7, 8
+            )
+            result = self.server.push_test_cases_to_testrail(
+                preview["preview_id"],
+                user_approved=True,
+                duplicate_decisions={"TC-FEATURE-001": "create"},
+            )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["created"][0]["testrail_case_id"], "C901")
+        self.assertEqual(result["skipped"], [])
+        create_case.assert_called_once()
+
+    def test_testrail_export_rejects_duplicate_changes_since_preview(self):
+        case = _case()
+        self.assertTrue(self.server.save_test_cases("STUD-1", _suite([case]))["ok"])
+        target = {
+            "suite": {"id": 7, "name": "Regression"},
+            "section": {"id": 8, "name": "Notes"},
+        }
+        with (
+            mock.patch.object(self.server.testrail_client, "validate_case_target", return_value=target),
+            mock.patch.object(self.server.testrail_client, "list_cases", side_effect=[
+                [],
+                [{"id": 900, "title": case["title"], "section_id": 8}],
+            ]),
+            mock.patch.object(self.server.testrail_client, "create_case") as create_case,
+        ):
+            preview = self.server.preview_test_cases_to_testrail(
+                "STUD-1", ["TC-FEATURE-001"], 7, 8
+            )
+            result = self.server.push_test_cases_to_testrail(
+                preview["preview_id"], user_approved=True
+            )
+        self.assertFalse(result["ok"])
+        self.assertIn("changed since preview", result["error"])
+        create_case.assert_not_called()
 
 
 class AutomationContextPagingTests(unittest.TestCase):
@@ -1071,13 +1542,17 @@ class StoryContextPagingTests(unittest.TestCase):
         import mcp_server
         self.server = mcp_server
         self.previous_cache = mcp_server._story_context_cache.copy()
+        self.previous_payloads = mcp_server._story_context_payloads.copy()
         self.previous_followups = mcp_server._story_context_followup_calls.copy()
         mcp_server._story_context_cache.clear()
+        mcp_server._story_context_payloads.clear()
         mcp_server._story_context_followup_calls.clear()
 
     def tearDown(self):
         self.server._story_context_cache.clear()
         self.server._story_context_cache.update(self.previous_cache)
+        self.server._story_context_payloads.clear()
+        self.server._story_context_payloads.update(self.previous_payloads)
         self.server._story_context_followup_calls.clear()
         self.server._story_context_followup_calls.update(self.previous_followups)
 
@@ -1095,6 +1570,41 @@ class StoryContextPagingTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertIn(result["context_id"], self.server._story_context_cache)
         self.assertEqual(context["product_knowledge"], [])
+
+    def test_large_story_context_pages_are_bounded_lossless_and_stable(self):
+        context = {
+            "story": {"key": "STUD-18288", "summary": "NLS story"},
+            "source_text": {"acceptance_criteria": 'Exact "quotes"\\paths\n\u2013\U0001f600' * 1000},
+            "product_knowledge": [],
+            "warnings": ["Review source warnings"],
+        }
+        with mock.patch.object(self.server, "_context", return_value=context):
+            result = self.server.get_story_context("STUD-18288")
+        self.assertTrue(result["paged"])
+        self.assertEqual(result["page_tool"], "get_story_context_page")
+        self.assertLess(len(json.dumps(result).encode("utf-8")), 8000)
+        context_id = result["context_id"]
+        self.server._story_context_cache[context_id]["product_knowledge"].append({"id": "later"})
+        offset, fragments = 0, []
+        while offset is not None:
+            page = self.server.get_story_context_page(context_id, offset)
+            self.assertTrue(page["ok"])
+            self.assertLess(len(json.dumps(page).encode("utf-8")), 8000)
+            fragments.append(page["content"])
+            next_offset = page["next_offset"]
+            if next_offset is not None:
+                self.assertGreater(next_offset, offset)
+            offset = next_offset
+        self.assertEqual(json.loads("".join(fragments)), context)
+        self.assertFalse(self.server.get_story_context_page(context_id, -1)["ok"])
+        self.assertFalse(self.server.get_story_context_page(context_id, result["total_characters"] + 1)["ok"])
+        self.assertFalse(self.server.get_story_context_page("unknown")["ok"])
+
+    def test_story_context_pages_expire_with_cached_context(self):
+        first_id = self.server._cache_story_context({"story": {"key": "STUD-1"}})
+        for _ in range(self.server._STORY_CONTEXT_CACHE_LIMIT):
+            self.server._cache_story_context({"story": {}})
+        self.assertFalse(self.server.get_story_context_page(first_id)["ok"])
 
     def test_story_context_followups_are_source_scoped_and_bounded(self):
         context_id = "story-context-test"

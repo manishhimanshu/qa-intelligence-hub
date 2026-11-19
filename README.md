@@ -5,7 +5,7 @@ One repository provides two QA tools that share configuration and a knowledge ba
 | Tool | Purpose | Entry point |
 |---|---|---|
 | Streamlit Hub | Manual test-case generation, coverage dashboard, and Jira gap analysis | `custom-agent-ui/app.py` |
-| QA Copilot | Jira/TestRail analysis and test generation, plus grounded Cypress automation through GitHub Copilot | `.github/agents/qa-analyst.agent.md` |
+| QA Copilot | Jira/TestRail analysis and test generation, approved TestRail case export, plus grounded Cypress automation through GitHub Copilot | `.github/agents/qa-analyst.agent.md` |
 
 ## How the Tools Fit Together
 
@@ -31,6 +31,14 @@ Both tools read the same `rag/.env`, `rag/faiss_index`, and `rag/docs`. The Stre
 - Jira and TestRail credentials for the services you plan to use
 - An OpenAI API key for Streamlit test generation and gap analysis
 - For QA Copilot only: GitHub Copilot CLI, signed-in Copilot access, and Node.js 22 or later
+
+If Python is not installed and `winget` is available, install it from PowerShell with:
+
+```powershell
+winget install --id Python.Python.3.12 --exact
+```
+
+Close and reopen PowerShell after installation. If `winget` is unavailable, install Python 3.12+ from [python.org](https://www.python.org/downloads/windows/) and enable the Python launcher or add Python to `PATH`.
 
 ### 1. Clone and retrieve the knowledge index
 
@@ -104,6 +112,10 @@ The Copilot MCP registration helper is currently a PowerShell script for Windows
 
 ## Refresh the Knowledge Base
 
+Shared cross-feature role/access guidance is maintained in `rag/docs/shared/role-permissions.md`. Markdown ingestion includes this nested directory automatically. After moving the file from its former docs-root location, rebuild the index and restart QA Hub/Streamlit to refresh indexed source paths.
+
+Shared feature aliases belong in `rag/config/feature-aliases.json`. Feature-specific automation documents belong in `rag/docs/automation/feature-context/<canonical-feature-key>/<canonical-feature-key>-feature-context.md` (for example, `notes/notes-feature-context.md`). The existing files are tracked; newly added files in these ignored locations require explicit staging. Moving documents from the old flat layout requires a full index rebuild and restarting the tools; see [CLI feature configuration](qa-copilot-cli/README.md).
+
 The checked-in Git LFS index is sufficient for normal use. Rebuild it only when the indexed Jira, TestRail, documentation, or Cypress data needs refreshing. Configure `rag/.env` first. For Cypress chunks, set `AUTOMATION_REPO_ROOT` to a valid Cypress repository path.
 
 Windows PowerShell:
@@ -115,12 +127,14 @@ $env:PYTHONIOENCODING = "utf-8"
 Pop-Location
 ```
 
-To rebuild only selected sources, pass source names such as `jira`, `testrail`, `docs`, `pdf`, or `automation` after `ingest_all.py`. If `AUTOMATION_REPO_ROOT` is not set, automation ingestion is skipped with a warning; the rest of the index can still be rebuilt.
+With no source arguments, ingestion rebuilds the entire index. Passing source names such as `jira`, `testrail`, `docs`, `pdf`, or `automation` performs an incremental update instead; it does not refresh existing document IDs. If `AUTOMATION_REPO_ROOT` is not set, automation ingestion is skipped with a warning; the rest of the index can still be rebuilt.
+
+On Windows, ingestion uses the system certificate store through `truststore` while keeping HTTPS certificate verification enabled. A TestRail suite, section, or case fetch failure aborts a full rebuild before replacing the existing index. If a previous run reported TestRail errors followed by a successful build, rerun the full rebuild after resolving the error; that index may be missing TestRail cases. Restart running MCP servers after rebuilding to clear their cached index.
 
 ## Tests
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s qa-copilot-cli/tests -p test_core.py
+.\.venv\Scripts\python.exe -m unittest discover -s qa-copilot-cli/tests -p "test_*.py"
 ```
 
 ## Repository Layout

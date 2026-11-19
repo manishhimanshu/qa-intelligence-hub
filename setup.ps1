@@ -7,6 +7,14 @@ $requirements = Join-Path $repoRoot "requirements.txt"
 $envFile = Join-Path $repoRoot "rag\.env"
 $envTemplate = Join-Path $repoRoot "rag\.env.example"
 
+function Get-PythonInstallGuidance {
+    $wingetCommand = Get-Command winget -ErrorAction SilentlyContinue
+    if ($wingetCommand) {
+        return "Python 3.12 or later is required. Install it with: winget install --id Python.Python.3.12 --exact`nAfter installation, close and reopen PowerShell, then rerun .\setup.ps1."
+    }
+    return "Python 3.12 or later is required. Install it from https://www.python.org/downloads/windows/ and enable the Python launcher or add Python to PATH. Close and reopen PowerShell, then rerun .\setup.ps1."
+}
+
 if (-not (Test-Path $requirements)) { throw "Root requirements.txt was not found at $requirements." }
 if (-not (Test-Path $envTemplate)) { throw "Environment template was not found at $envTemplate." }
 
@@ -20,12 +28,14 @@ if (-not (Test-Path $venvPython)) {
     }
     if (-not $created) {
         $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
-        if (-not $pythonCommand) { throw "Install Python 3.12 or later, then rerun .\setup.ps1." }
+        if (-not $pythonCommand) { throw (Get-PythonInstallGuidance) }
         $basePython = $pythonCommand.Source
         $baseVersionText = & $basePython -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
-        if ($LASTEXITCODE -ne 0) { throw "Could not run Python at $basePython." }
+        if ($LASTEXITCODE -ne 0 -or $baseVersionText -notmatch '^\d+\.\d+$') {
+            throw (Get-PythonInstallGuidance)
+        }
         if ([version]$baseVersionText -lt [version]"3.12") {
-            throw "Python 3.12 or later is required. Found Python $baseVersionText."
+            throw "Found Python $baseVersionText, but Python 3.12 or later is required.`n$(Get-PythonInstallGuidance)"
         }
         & $basePython -m venv $venvPath
     }
